@@ -1,0 +1,52 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Virtual env =====
+.venv/
+venv/
+
+# ===== HuggingFace / Model cache =====
+_hf_cache/
+.cache/
+*.bin
+*.pt
+*.safetensors
+
+# ===== Data (keep structure, ignore contents) =====
+data/raw/**
+data/interim/**
+data/outputs/**
+data/processed/**
+
+# keep input configs / samples
+!data/input/**
+!data/processed/sample_*.csv
+
+# ===== Artifacts / Outputs =====
+outputs/**
+artifacts/**
+
+# ===== Vector / numeric artifacts =====
+*.npy
+*.npz
+*.faiss
+*.index
+
+# ===== Logs & temp =====
+*.log
+_tmp/
+temp/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== Secrets =====
+.env

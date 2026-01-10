@@ -1,0 +1,91 @@
+{
+  "positive_rules": [
+    {
+      "tag": "annual_report",
+      "keywords": [
+        "annual report",
+        "annual reports",
+        "annual-report",
+        "annual-reports",
+        "annual review",
+        "annual-review",
+        "annualreport",
+        "reportsannual"
+      ],
+      "weight": 25
+    },
+    {
+      "tag": "10-K",
+      "keywords": [
+        "10-k",
+        "10k",
+        "form 10-k",
+        "form 10k"
+      ],
+      "weight": 18
+    },
+    {
+      "tag": "sec_filings",
+      "keywords": [
+        "sec filings",
+        "sec-filings",
+        "secfilings",
+        "sec filing",
+        "sec-filing"
+      ],
+      "weight": 8
+    },
+    {
+      "tag": "investor_relations",
+      "keywords": [
+        "investor relations",
+        "investor-relations",
+        "investors",
+        "shareholder",
+        "shareowners"
+      ],
+      "weight": 6
+    },
+    {
+      "tag": "financial_reports",
+      "keywords": [
+        "financial reports",
+        "financial report",
+        "financial information",
+        "financial-information",
+        "financials",
+        "financial results",
+        "financial-results",
+        "financial statements",
+        "financial-statements",
+        "financial highlights",
+        "financial-highlights"
+      ],
+      "weight": 10
+    }
+  ],
+  "negative_keywords": [
+    "privacy",
+    "security",
+    "careers",
+    "jobs",
+    "press",
+    "news",
+    "branch",
+    "location",
+    "atm",
+    "cookies",
+    "disclosure",
+    "fraud"
+  ],
+  "negative_penalty": 8,
+  "score_thresholds": {
+    "HIGH": 30,
+    "MEDIUM": 15,
+    "LOW": 5
+  },
+  "crawl": {
+    "max_depth": 2,
+    "max_pages_per_bank": 40
+  }
+}
