@@ -1,6 +1,13 @@
+"""
+Collect candidate entry pages for bank annual reports / 10-K filings.
+
+This script crawls bank websites starting from a given entry URL,
+applies BFS with domain constraints, scores pages based on configurable
+rules, and identifies candidate pages that may contain annual report PDFs.
+"""
 import json
 import time
-import re  # NEW: 用于提取年份
+import re  # Used for extracting 4-digit years from text
 from urllib.parse import urljoin, urlparse
 import sys
 from pathlib import Path
@@ -12,7 +19,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 def find_repo_root(start: Path) -> Path:
     p = start.resolve()
-    for _ in range(10):  # 最多向上找 10 层
+    for _ in range(10):  # Search up to 10 parent directories for the project root
         if (p / ".git").exists() or (p / "README.md").exists() or (p / "data").exists():
             return p
         p = p.parent
@@ -23,6 +30,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 def get_root_host(url: str) -> str | None:
+    """
+    Extract the root domain (e.g., example.com) from a URL.
+    Returns None if the URL is invalid or cannot be parsed.
+    """
     try:
         if not url:
             return None
@@ -39,14 +50,11 @@ def get_root_host(url: str) -> str | None:
         return None
 
 
-
-# ======== 配置路径 ========
 INPUT_CSV = ROOT/"data"/"input"/"successful bank report list_20251209.csv"
 CONFIG_FILE = ROOT/"config"/"entry_page_scoring_config.json"
-OUTPUT_CSV = ROOT/"data"/"interim"/"output"/"log"/"bank_candidate_entry_pages_for_pdf_2rd.csv"  # NEW: 输出文件名改一下，表明是为PDF服务的
+OUTPUT_CSV = ROOT/"data"/"interim"/"output"/"log"/"bank_candidate_entry_pages_for_pdf_2rd.csv"  # Output candidate entry pages for downstream PDF collection
 
-# 调试时可以只跑前 N 个银行
-LIMIT_BANKS = 40  # 调试时 20，OK 再改成 None
+LIMIT_BANKS = 40  # Optional limit for batch processing; set to None for full run
 # LIMIT_BANKS = None
 
 HEADERS = {
@@ -63,39 +71,40 @@ ALLOWED_EXTERNAL_ROOTS = {
     "s1.q4cdn.com",
     "q4ir.com",
     "materials.proxyvote.com",
-    # NEW: 适当加一些常见 IR/CDN 域名（后续可以再补）
+    # Common external IR / CDN domains allowed during crawling
     "gcs-web.com",
     "corporate-ir.net",
     "services.corporate-ir.net",
     "s3.amazonaws.com",
 }
-# 某些银行的 IR/年报入口在另外的域名，需要手动 override
+# Some banks host investor relations or annual reports on external domains.
+# These overrides define stable entry points for crawling.
 BANK_START_URL_OVERRIDE = {
-    # FMStBank: 你的手动检查链接
+    # FMStBank: manually verified IR landing page
     "FMStBank": "https://ir.fm.bank/fms",
 
-    # gntybank: 官方 IR 在 gnty.com
+    # Extract candidate fiscal years from link text and URL.
     "gntybank": "https://www.gnty.com/investors/",
 
-    # AlwaysOurBest: Skyline National Bank 的 Q4 IR 平台
+    # AlwaysOurBest: Skyline National Bank investor relations site hosted on a Q4 platform.
     "AlwaysOurBest": "https://investors.skylinenationalbank.com/financials/annual-reports/default.aspx",
 
-    # EphrataNational: 直接指向 annual reports 列表页（可选，但有利于稳定抓 pdf）
+    # EphrataNational: optional override to jump directly to the annual reports listing page.
     "EphrataNational": "https://enbfinancial.q4ir.com/financial-information/annual-reports-and-documents/default.aspx",
 
-    # CapitalOne 也可以直接用 investor 年报页（可选）
+    # CapitalOne: optional override to start from the investor annual reports hub.
     "CapitalOne": "https://investor.capitalone.com/financial-results/annual-reports"
 }
 
 
 def fetch_html_playwright(url: str, max_total_timeout: int = 30000) -> str | None:
     """
-    更稳健的 Playwright fallback：
-    - 总耗时不会超过 max_total_timeout（默认 30 秒）
-    - navigation timeout = 10 秒
-    - content timeout = 5 秒
-    - 三次重试
-    - 失败会强制关闭浏览器避免 hanging
+    Robust Playwright-based HTML fetcher with bounded total runtime.
+
+    Design considerations:
+    - Enforces a maximum total timeout across retries
+    - Uses short navigation and content timeouts per attempt
+    - Retries multiple times and ensures browser instances are closed
     """
     start_time = time.time()
     attempts = 3
@@ -158,34 +167,10 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
-# def safe_get(session: requests.Session, url: str) -> str | None:
-#     """先用 requests，4xx/空页面再用 Playwright 补救。"""
-#     try:
-#         resp = session.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
-#         status = resp.status_code
-#         text = resp.text or ""
-#         if 200 <= status < 300 and len(text) > 500 and "<html" in text.lower():
-#             return text
-#         else:
-#             print(f"[WARN] {status} or weak HTML for {url}, fallback PW")
-#     except Exception as e:
-#         print(f"[ERROR] GET {url}: {e} -> fallback PW")
-
-#     # fallback：Playwright
-#     html = fetch_html_playwright(url)
-#     if html and len(html) > 500:
-#         return html
-
-#     print(f"[ERROR] both requests & PW failed for {url}")
-#     return None
-
-# -------------------------
-# Helpers
-# -------------------------
-
 def looks_like_ir_domain(url: str) -> bool:
     """
-    Q4 / Investor relations / heavy JS domains.
+    Heuristically identify investor-relations or Q4-style domains
+    that typically require heavier JavaScript rendering.
     """
     patterns = [
         r"(^|\.)ir\.", r"(^|\.)investor", r"q4cdn", r"q4web", r"q4inc",
@@ -195,13 +180,13 @@ def looks_like_ir_domain(url: str) -> bool:
 
 
 def ok_html(text: str) -> bool:
-    """判断 HTML 是否有效"""
+    """Heuristically determine whether the HTML response is valid."""
     if not text:
         return False
     text_low = text.lower()
     if "<html" not in text_low:
         return False
-    if len(text_low) < 800:  # 太短，大概率是被挡住了
+    if len(text_low) < 800:  # Too short; likely blocked, truncated, or non-content page
         return False
     return True
 
@@ -274,7 +259,7 @@ def try_playwright_v1(url: str) -> str | None:
 
 
 # -------------------------
-# Layer 2: Playwright v2 （Anti-WAF）
+# Layer 2: Playwright v2 (anti-WAF mode for IR-heavy domains)
 # -------------------------
 
 def try_playwright_v2(url: str) -> str | None:
@@ -334,10 +319,11 @@ def try_playwright_v2(url: str) -> str | None:
 
 def safe_get_html(url: str, depth: int) -> str | None:
     """
-    三段式 HTML 获取策略：
-    Layer 0: requests
-    Layer 1: PWv1（轻量）
-    Layer 2: PWv2（重模式，仅入口页 + IR 域）
+    Three-stage HTML retrieval strategy:
+    
+    Layer 0: requests (fast path for static pages)
+    Layer 1: Playwright v1 (lightweight JS rendering)
+    Layer 2: Playwright v2 (anti-WAF mode for entry pages and IR domains)
     """
     print(f"[safe_get_html] depth={depth} url={url}")
 
@@ -367,15 +353,17 @@ def safe_get_html(url: str, depth: int) -> str | None:
 
 
 def is_allowed_domain(url: str, base_root: str | None, entry_root: str | None) -> bool:
-    """允许：
-    1. 与 base_url 同根域
-    2. 与 entry_url 同根域
-    3. 在允许的外部 IR/CDN（q4ir/q4cdn/sec.gov 等）
+    """
+    Determine whether a URL is allowed to be crawled.
+    Allowed cases:
+    1. Same root domain as base_url
+    2. Same root domain as entry_url
+    3. Whitelisted external IR / CDN domains (e.g., q4ir, q4cdn, sec.gov)
     """
     try:
         n = urlparse(url)
         if not n.netloc:
-            return True  # 相对路径
+            return True  # Relative URL (no netloc); treat as same-site.    
 
         host = n.netloc.lower()
         parts = host.split(".")
@@ -411,9 +399,11 @@ def get_page_title(html: str) -> str:
 
 def score_page(url: str, anchor_text: str, page_title: str, cfg: dict) -> tuple[int, list[str], list[str]]:
     """
-    根据 URL + anchor_text + title 打分，返回 (score, tags, reasons)
-    tags: ["annual_report", "sec_filings", ...]
-    reasons: ["annual_report::annual report", "10-K::10-k", ...]
+    Score a page using URL + anchor_text + page_title.
+    Returns:
+        (score, tags, reasons)
+        - tags: a sorted list of matched rule tags (e.g., "annual_report", "sec_filings").
+        - reasons: human-readable matches (e.g., "annual_report::annual report", "NEG::privacy").
     """
     positive_rules = cfg["positive_rules"]
     negative_keywords = cfg["negative_keywords"]
@@ -426,7 +416,7 @@ def score_page(url: str, anchor_text: str, page_title: str, cfg: dict) -> tuple[
     tags: set[str] = set()
     reasons: list[str] = []
 
-    # 正向加分
+    # Apply positive scoring rules (keyword hits add weight).
     for rule in positive_rules:
         tag = rule["tag"]
         weight = rule["weight"]
@@ -437,7 +427,7 @@ def score_page(url: str, anchor_text: str, page_title: str, cfg: dict) -> tuple[
                 tags.add(tag)
                 reasons.append(f"{tag}::{kw}")
 
-    # 负向减分
+    # Apply negative keywords (keyword hits subtract a fixed penalty).  
     for kw in negative_keywords:
         kw_l = kw.lower()
         if kw_l in url_l or kw_l in text:
@@ -448,6 +438,10 @@ def score_page(url: str, anchor_text: str, page_title: str, cfg: dict) -> tuple[
 
 
 def classify_level(score: int, cfg: dict) -> str | None:
+    """
+    Classify a page into HIGH / MEDIUM / LOW based on score thresholds.
+    Returns None if the score is below the minimum threshold.
+    """
     th = cfg["score_thresholds"]
     if score >= th["HIGH"]:
         return "HIGH"
@@ -455,14 +449,14 @@ def classify_level(score: int, cfg: dict) -> str | None:
         return "MEDIUM"
     if score >= th["LOW"]:
         return "LOW"
-    return None  # 分太低，不纳入候选（不过如果有 PDF 我们会破例）
+    return None  # Below the minimum threshold; exclude unless PDFs are present (handled separately).
 
-
-# ========= NEW: PDF 相关辅助函数 =========
+# ========= PDF-related helpers =========
 
 def extract_years_from_text(text: str) -> set[str]:
     """
-    从文本中提取 1900-2099 的 4 位年份，返回 set[str]。
+    Extract 4-digit years (1900–2099) from text.
+    Returns a set of year strings.
     """
     if not text:
         return set()
@@ -472,21 +466,21 @@ def extract_years_from_text(text: str) -> set[str]:
 
 def analyze_pdfs_on_page(html: str, page_url: str) -> tuple[int, dict | None]:
     """
-    在当前页面中扫描所有 <a>，识别 PDF 链接并打分。
-    返回:
-      - pdf_count: 此页上 PDF 链接数量
-      - best_pdf: 最佳 PDF 候选信息 dict 或 None：
-        {
-          "pdf_url": str,
-          "score": int,
-          "years": "2022,2023",
-          "is_10k": bool,
-          "anchor_text": str,
-        }
+    Scan all <a> tags on the page, identify PDF links, and score them.
+    Returns:
+        pdf_count: Number of PDF links found on the page
+        best_pdf: Best PDF candidate information dict, or None if not found.
+            {
+                "pdf_url": str,
+                "score": int,
+                "years": "2022,2023",
+                "is_10k": bool,
+                "anchor_text": str,
+            }
     """
-    # 一些典型“不是年报/10-K”的噪声 PDF（fees、表单、charter 等）
+    # Common non-annual-report PDF patterns (fees, forms, charters, policies, etc.)
     NEG_PDF_KEYWORDS = [
-        "patriot",              # CapitalOne 那个 patriot_2025.pdf
+        "patriot",              # Known non-report PDF pattern observed on CapitalOne (e.g., patriot_2025.pdf).
         "switch-kit", "switch kit",
         "schedule-of-fees", "schedule of fees",
         "fee schedule", "feeschedule",
@@ -508,74 +502,37 @@ def analyze_pdfs_on_page(html: str, page_url: str) -> tuple[int, dict | None]:
         text = a.get_text(" ", strip=True) or ""
         text_low = text.lower()
 
-        # # 只看 pdf
-        # if not href_low.endswith(".pdf"):
-        #     continue
-
-        # pdf_count += 1
-
-        # # 收集年份
-        # years = extract_years_from_text(text_low) | extract_years_from_text(href_low)
-
-        # is_10k = ("10-k" in text_low) or ("10k" in text_low) or ("form 10-k" in text_low) or ("10-k" in href_low)
-
-        # score = 0
-        # # 基础分：是 PDF
-        # score += 10
-
-        # # 文本/链接里提到 annual report / annual
-        # if "annual report" in text_low or "annual report" in href_low:
-        #     score += 10
-        # elif "annual" in text_low or "annual" in href_low:
-        #     score += 5
-
-        # # 10-K 加分
-        # if is_10k:
-        #     score += 8
-
-        # # 有年份的加分，多年合计
-        # if years:
-        #     # 最近几年（>=2019）的稍微多加一点
-        #     for y in years:
-        #         try:
-        #             y_int = int(y)
-        #             if y_int >= 2019:
-        #                 score += 4
-        #             else:
-        #                 score += 2
-        #         except ValueError:
-        #             score += 2
         
-        # 只看 pdf
+        # Only consider direct PDF links.
         if not href_low.endswith(".pdf"):
             continue
 
-        # 噪声 PDF 过滤：文件名或文本里出现典型无关词，直接跳过
+        # Filter out common non-report PDFs: if filename or anchor text contains typical irrelevant keywords, skip.
         if any(kw in href_low or kw in text_low for kw in NEG_PDF_KEYWORDS):
             continue
 
         pdf_count += 1
 
-        # 收集年份
+        # Extract candidate fiscal years from anchor text and URL.
         years = extract_years_from_text(text_low) | extract_years_from_text(href_low)
 
         is_10k = ("10-k" in text_low) or ("10k" in text_low) or ("form 10-k" in text_low) or ("10-k" in href_low)
 
         score = 0
-        # 基础分：是 PDF
+        # Base score for being a PDF link.
         score += 10
 
-        # 文本/链接里提到 annual report / annual
+        # Boost when anchor text or URL contains annual-report keywords.
         if "annual report" in text_low or "annual report" in href_low:
-            score += 20      # 年报强相关，直接 +20
+            score += 20      # Strong annual-report signal.
         elif "annual" in text_low or "annual" in href_low:
             score += 10
 
-        # 10-K 加分（仅次于 annual）
+        # Boost for 10-K / Form 10-K signals (secondary to annual-report terms).
         if is_10k:
             score += 15
 
-        # 有年份的加分，多年合计
+        # Additional points for explicit years; multiple years accumulate.
         if years:
             for y in years:
                 try:
@@ -604,8 +561,7 @@ def analyze_pdfs_on_page(html: str, page_url: str) -> tuple[int, dict | None]:
         return pdf_count, best_pdf[1]
 
 
-# ========= 主搜索逻辑（BFS） =========
-
+# ========= Main crawling logic (BFS) =========
 
 def collect_candidates_for_bank(
     session: requests.Session,
@@ -618,17 +574,19 @@ def collect_candidates_for_bank(
     entry_root: str | None,
 ) -> list[dict]:
     """
-    从某个银行的起始 URL 出发，BFS 收集候选入口页 + PDF 信息。
-    返回记录列表，每条包含：
-      - score / level / tags / reasons
-      - pdf_count_on_page / best_pdf_* 等
+    Starting from a bank-specific entry URL, perform BFS crawling to collect
+    candidate entry pages and associated PDF information.
+    Returns a list of records, each containing:
+        - score, level, tags, reasons
+        - pdf_count_on_page
+        - best_pdf_* fields if applicable
     """
     crawl_cfg = cfg["crawl"]
     max_depth = crawl_cfg["max_depth"]
     max_pages = crawl_cfg["max_pages_per_bank"]
 
     visited: set[str] = set()
-    # 队列元素: (url, depth, parent_url, anchor_text)
+    # Queue item: (url, depth, parent_url, anchor_text)
     queue: list[tuple[str, int, str | None, str | None]] = [(start_url, 0, None, None)]
 
     candidates: list[dict] = []
@@ -652,10 +610,10 @@ def collect_candidates_for_bank(
 
         page_title = get_page_title(html)
 
-        # 先分析当前页面上的 PDF 链接（为下载脚本做准备）
+        # Analyze PDF links on the page first (used later by the download step).
         pdf_count, best_pdf = analyze_pdfs_on_page(html, url)  # NEW
 
-        # 1) 对当前页面打分，判断是否纳入“候选入口页”
+        # 1) Score the current page to decide whether to keep it as a candidate entry page.
         score, tags, reasons = score_page(
             url=url,
             anchor_text=anchor_text or "",
@@ -664,16 +622,21 @@ def collect_candidates_for_bank(
         )
         level = classify_level(score, cfg)
 
-        # ---- NEW: 入筛条件拆开 & 放宽 ----
+        # Selection criteria:
+        # A page is kept as a candidate if it satisfies at least one of the following:
+        # - Contains PDF links
+        # - Has a positive relevance score
+        # - Matches important financial-related tags
         important_tags = {"annual_report", "10-K", "sec_filings", "financial_reports", "investor_relations"}
 
         has_important_tag = any(t in important_tags for t in tags)
         has_positive_score = score > 0
 
-        # 满足任一条件就写入候选：
-        # 1）页面上有 PDF
-        # 2）有正分
-        # 3）命中重要 tag
+        # Selection criteria:
+        # A page is kept as a candidate if it satisfies at least one of the following:
+        # - Contains PDF links
+        # - Has a positive relevance score
+        # - Matches important financial-related tags
         if pdf_count > 0 or has_positive_score or has_important_tag:
             row = {
                 "idrssd": idrssd,
@@ -708,7 +671,7 @@ def collect_candidates_for_bank(
             candidates.append(row)
 
 
-        # 2) 决定是否扩展下一层链接（BFS）
+        # 2) Decide whether to expand to the next layer (BFS crawl).
         if depth == max_depth:
             continue
 
@@ -719,7 +682,7 @@ def collect_candidates_for_bank(
             new_url = urljoin(url, href)
             new_url_l = new_url.lower()
 
-            # 静态资源过滤
+            # Skip non-HTML static assets (images/CSS/JS/icons/PDF).
             if any(
                 new_url_l.endswith(ext)
                 for ext in [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".ico"]
@@ -732,7 +695,7 @@ def collect_candidates_for_bank(
             link_text = a.get_text(" ", strip=True) or ""
             link_text_low = link_text.lower()
 
-            # depth = 0 时，稍微放宽，只要和 investor/financial 有点关系就扩展
+            # At depth=0 we expand more broadly to reach IR/financial hubs quickly.
             if depth == 0:
                 if any(
                     kw in new_url_l
@@ -761,7 +724,7 @@ def collect_candidates_for_bank(
                 ):
                     queue.append((new_url, depth + 1, url, link_text))
             else:
-                # depth >= 1 时，收紧，只扩展更像财报/年报的链接
+                # At depth>=1 we tighten expansion to links that look like annual reports / 10-K / filings pages.
                 if any(
                     kw in new_url_l
                     for kw in [
@@ -789,7 +752,7 @@ def main():
     cfg = load_config(CONFIG_FILE)
     df = pd.read_csv(INPUT_CSV)
 
-    # 只取 financial report = YES 的行
+    # Only keep banks explicitly marked as having financial reports
     banks = df[df["financial report"] == "YES"].copy()
 
     if LIMIT_BANKS is not None:
@@ -805,9 +768,9 @@ def main():
         username = row.get("username")
         base_url = row.get("url")
 
-        # entry_url 作为财报入口（优先），没有就退回 base_url
+        # Use financial report link as the primary entry URL; fallback to base_url if missing
         entry_url = row.get("financial report link") or base_url
-        # 允许按 username 覆盖起始入口（跨域 IR 平台等特殊情况）
+        # Allow username-based overrides for special cases (e.g., cross-domain IR platforms)
         override = BANK_START_URL_OVERRIDE.get(str(username))
         if override:
             print(f"  [OVERRIDE] use custom start_url for {username}: {override}")

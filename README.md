@@ -71,6 +71,7 @@ Hybrid Extraction
    ↓
 Structured CSV Output
 ```
+This is a fully offline, batch-oriented pipeline designed for deterministic and reproducible runs.
 
 **Key design choice:**  
 > Batch table extraction → CSV delivery, **not conversational QA**.
@@ -135,7 +136,7 @@ Every extracted value is traceable back to an indexed text chunk.
 
 ## 6. Reproducibility & Smoke Test
 
-To validate the pipeline **without recomputation**:
+### 6.1 To validate the pipeline **without recomputation**:
 
 ```bash
 python scripts/dryrun_validate.py
@@ -147,6 +148,35 @@ This checks:
 - Embedding model availability
 - LLM initialization
 - Output path consistency
+
+### 6.2 Smoke Tests
+
+The repository includes lightweight smoke tests to verify that core artifacts
+are valid and runnable without re-running the full pipeline.
+
+#### 6.2.1 Embedding Consistency Check
+
+Verifies that each embedding shard (`.npy`) contains the same number of vectors
+as its corresponding chunk metadata file (`.jsonl`).
+
+```bash
+python scripts/check/check_embeddings_outputs.py
+```
+
+Expected output:
+```text
+[DONE] items=<N> bad=0
+```
+
+#### 6.2.2 FAISS Retrieval Sanity Check
+
+Loads the FAISS index and runs an interactive query loop to inspect top-k matches.
+This test validates index loading, metadata alignment, and embedding inference
+(with automatic CUDA → CPU fallback).
+
+```bash
+python scripts/debug/query_faiss.py
+```
 
 ---
 
@@ -183,7 +213,14 @@ This project emphasizes **engineering reliability** over absolute metric complet
 ## 10. Tech Stack
 
 - Python 3.10
-- FAISS (IVF-PQ)
+- FAISS (IVF-PQ index for large-scale vector retrieval)
 - sentence-transformers / BGE-M3
 - Ollama (Qwen3-4B)
 - OCR & PDF processing tools
+
+## Project Status
+
+- Full pipeline implemented and validated
+- Embeddings and FAISS index built for 2024 reports
+- Metrics extraction completed and verified
+- Codebase cleaned, documented, and ready for public review

@@ -1,3 +1,14 @@
+"""
+OCR and text extraction for downloaded annual report PDFs.
+
+This script:
+1. Runs OCR on PDFs using ocrmypdf when needed
+2. Normalizes outputs into a unified OCR PDF directory
+3. Extracts text from OCR-processed PDFs into plain text files
+4. Records per-file status in a structured CSV log
+
+Designed for batch processing with bounded parallelism.
+"""
 import subprocess
 from pathlib import Path
 import csv
@@ -6,9 +17,10 @@ import os
 import fitz  # PyMuPDF
 import shutil  
 import sys
+
 def find_repo_root(start: Path) -> Path:
     p = start.resolve()
-    for _ in range(10):  # 最多向上找 10 层
+    for _ in range(10):  # Search up to 10 parent directories for the project root
         if (p / ".git").exists() or (p / "README.md").exists() or (p / "data").exists():
             return p
         p = p.parent
@@ -18,6 +30,7 @@ ROOT = find_repo_root(Path(__file__))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Configure a project-local temporary directory for OCR-related intermediate files
 CUSTOM_TEMP = ROOT/"_tmp"/"ocr_temp"
 os.makedirs(CUSTOM_TEMP, exist_ok=True)
 
@@ -25,7 +38,7 @@ os.environ["TMP"] = CUSTOM_TEMP
 os.environ["TEMP"] = CUSTOM_TEMP
 os.environ["TMPDIR"] = CUSTOM_TEMP
 
-# ======== 配置区 ========
+# ========= Configuration =========
 
 YEAR = "2024"
 
@@ -33,35 +46,38 @@ PDF_RAW_DIR = ROOT/"data"/"raw"/"pdf_downloads"/"annual_report"/ YEAR
 PDF_OCR_DIR = ROOT/"data"/"interim"/"output"/ YEAR
 TXT_OUT_DIR = ROOT/"data"/"interim"/"txt"/ YEAR
 
-# 结果日志
+# CSV log recording OCR and text extraction status
 LOG_CSV = ROOT/"data"/"interim"/"output"/"log"/f"ocr_extract_{YEAR}.csv"
 
-# 根据 CPU 自动估一个适合的并发数
+# Determine a reasonable level of parallelism based on available CPU cores
 CPU_COUNT = os.cpu_count() or 4
-# 留 1–2 个核给系统，不要全打满
+# Reserve 1–2 cores for the system to avoid resource contention
 NUM_JOBS = max(CPU_COUNT - 2, 1)
 
 PDF_OCR_DIR.mkdir(parents=True, exist_ok=True)
 TXT_OUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
 
-print(f"[INFO] 检测到 CPU {CPU_COUNT} 核，ocrmypdf 使用 --jobs {NUM_JOBS}")
+print(f"[INFO] Detected {CPU_COUNT} CPU cores; using --jobs {NUM_JOBS}")
 
-# ocrmypdf 命令，可按需要加参数
+# Base ocrmypdf command; additional flags can be added if needed.
 OCR_CMD_BASE = [
     "ocrmypdf",
-    "--force-ocr",          # 全部强制 OCR
-    "--deskew",             # 纠偏
-    "--optimize", "1",      # 轻度压缩
-    "--skip-big", "200",    # 超大文件跳过（MB）
-    "--jobs", str(NUM_JOBS) # ✅ 开多进程并行页级 OCR
+    "--force-ocr",          # Force OCR even if a text layer exists
+    "--deskew",             # Deskew pages
+    "--optimize", "1",      # Light PDF optimization
+    "--skip-big", "200",    # Skip very large PDFs (MB)
+    "--jobs", str(NUM_JOBS) # Enable parallel page-level OCR
 ]
 # ========================
 
 
 def pdf_has_text(pdf_path: Path, max_pages: int = 5) -> bool:
     """
-    粗略判断 PDF 是否已有可抽取文本（前 max_pages 页非空就认为有）
+    Heuristically determine whether a PDF already contains extractable text.
+
+    If any of the first `max_pages` pages contains non-empty text, the PDF
+    is considered text-searchable.
     """
     try:
         doc = fitz.open(pdf_path)
@@ -76,46 +92,29 @@ def pdf_has_text(pdf_path: Path, max_pages: int = 5) -> bool:
     return False
 
 
-# def ocr_pdf_if_needed(src: Path, dst: Path) -> str:
-#     """
-#     对单个 PDF 做 OCR：
-#     - 已有文本的话：直接复制（这里简单起见，仍用 ocrmypdf 但很快）
-#     - 返回 status: "ok", "skip", "fail"
-#     """
-#     dst.parent.mkdir(parents=True, exist_ok=True)
-
-#     cmd = OCR_CMD_BASE + [str(src), str(dst)]
-#     try:
-#         result = subprocess.run(
-#             cmd,
-#             capture_output=True,
-#             text=True,
-#             check=False,
-#         )
-#     except Exception as e:
-#         print(f"[OCR ERROR] {src} -> {dst}: {e}")
-#         return "fail"
-
-#     if result.returncode == 0:
-#         print(f"[OCR OK] {src.name}")
-#         return "ok"
-#     else:
-#         print(f"[OCR FAIL] {src.name} (code={result.returncode})")
-#         print("  stdout:", result.stdout[:500])
-#         print("  stderr:", result.stderr[:500])
-#         return "fail"
-
 def ocr_pdf_if_needed(src: Path, dst: Path) -> str:
-    # 先确保目录存在
+    """
+    Run OCR on a single PDF if required.
+
+    Behavior:
+    - If the destination OCR PDF already exists, reuse it
+    - If the source PDF contains a text layer, skip OCR and copy the file
+    - Otherwise, invoke ocrmypdf to generate an OCR-processed PDF
+
+    Returns:
+        "ok"   : OCR completed or reused successfully
+        "fail" : OCR failed with a non-recoverable error
+    """
+    # Ensure output directory exists
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # 如果已经有 OCR 后 pdf 了，直接复用
+    # Reuse existing OCR-processed PDF if it already exists.
     if dst.exists():
-        print(f"[OCR SKIP] 目标已存在，直接复用：{dst}")
+        print(f"[OCR SKIP] Reusing existing OCR PDF: {dst}")
         return "ok"
 
     cmd = OCR_CMD_BASE + [str(src), str(dst)]
-    print(f"[OCR] 开始 OCR: {src.name}")
+    print(f"[OCR] Running OCR for: {src.name}")
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -129,15 +128,15 @@ def ocr_pdf_if_needed(src: Path, dst: Path) -> str:
         return "ok"
 
     if rc == 3:
-        # 有文本层，不需要 OCR
-        print(f"[OCR SKIP] {src.name}：PDF 已有文本层，跳过 OCR")
+        # PDF already contains a text layer; OCR is not required.
+        print(f"[OCR SKIP] {src.name}: existing text layer detected")
         try:
-            shutil.copy2(src, dst)  # 保证后面统一用 dst 抽文本
+            shutil.copy2(src, dst)  # Copy to the OCR output location so downstream always reads from `dst`.
         except Exception as e:
-            print(f"[OCR SKIP WARN] 复制原始 PDF 到 {dst} 失败: {e}")
+            print(f"[OCR SKIP WARN] Failed to copy source PDF to {dst}: {e}")
         return "ok"
 
-    # 其它返回码视为真正失败
+    # All other return codes are treated as unrecoverable OCR failures
     print(f"[OCR FAIL] {src.name} (code={rc})")
     print("stdout:", result.stdout[:300])
     print("stderr:", result.stderr[:300])
@@ -146,7 +145,7 @@ def ocr_pdf_if_needed(src: Path, dst: Path) -> str:
 
 def extract_text(pdf_path: Path, txt_path: Path) -> bool:
     """
-    用 PyMuPDF 把 PDF 文本抽到 txt
+    Extract plain text from a PDF using PyMuPDF and write it to a UTF-8 text file.
     """
     txt_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -170,7 +169,7 @@ def extract_text(pdf_path: Path, txt_path: Path) -> bool:
 
 def iter_all_pdfs(root: Path):
     """
-    遍历所有银行文件夹下的 pdf
+    Iterate over all PDF files under per-bank subdirectories.
     """
     for bank_dir in sorted(root.glob("*")):
         if not bank_dir.is_dir():
@@ -181,16 +180,18 @@ def iter_all_pdfs(root: Path):
 
 def infer_bank_and_year(bank_folder: str, pdf_name: str) -> tuple[str, Optional[int]]:
     """
-    简单推一下 bank_name 和年份：
-    - bank_name 就用文件夹名
-    - 年份：在文件名里找 20xx，没有的话用 YEAR
+    Infer bank identifier and report year.
+
+    - The bank identifier is derived from the parent folder name
+    - The report year is extracted from the filename if present,
+    otherwise defaults to the configured YEAR
     """
     import re
 
     bank = bank_folder
     years = re.findall(r"(20\d{2})", pdf_name)
     yr = int(years[0]) if years else int(YEAR)
-    # 像 2025-SAR-Annual-Report 这种，可以后面再做规则映射成 2024
+    # Filenames like '2025-SAR-Annual-Report' may require custom year mapping in a later stage.
     return bank, yr
 
 
@@ -198,14 +199,14 @@ def main():
     PDF_OCR_DIR.mkdir(parents=True, exist_ok=True)
     TXT_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 收集所有 PDF，方便打印总进度
+    # Collect all PDFs upfront to report overall progress.
     all_pdfs = list(iter_all_pdfs(PDF_RAW_DIR))
     total = len(all_pdfs)
-    print(f"[INFO] 在 {PDF_RAW_DIR} 下共找到 {total} 个 PDF 文件")
+    print(f"Found {total} PDF files under {PDF_RAW_DIR}")
     if total == 0:
         return
 
-    # 打开日志文件（注意：下面所有 writer.writerow 都必须在这个 with 里面）
+    # Open the log file; all writer.writerow calls must remain within this context.
     with LOG_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -221,17 +222,17 @@ def main():
         ])
 
         for idx, (bank_folder, pdf_path) in enumerate(all_pdfs, start=1):
-            rel_bank_dir = bank_folder  # 如: DeutscheBank_214807
+            rel_bank_dir = bank_folder  # Example: DeutscheBank_214807
             bank_name, year = infer_bank_and_year(rel_bank_dir, pdf_path.name)
 
-            print(f"\n[{idx}/{total}] >>> 开始处理：{rel_bank_dir} / {pdf_path.name}")
+            print(f"\n[{idx}/{total}] Processing {rel_bank_dir} / {pdf_path.name}")
 
             ocr_pdf_path = PDF_OCR_DIR / rel_bank_dir / pdf_path.name
             txt_path = TXT_OUT_DIR / rel_bank_dir / (pdf_path.stem + ".txt")
 
-            # 已有 txt：直接跳过，写一行日志
+            # Skip processing if the text output already exists
             if txt_path.exists():
-                print(f"    [SKIP] 已存在 txt：{txt_path}")
+                print(f"    [SKIP] Text output already exists: {txt_path}")
                 writer.writerow([
                     rel_bank_dir,
                     pdf_path.name,
@@ -245,11 +246,11 @@ def main():
                 ])
                 continue
 
-            # 先 OCR
-            print(f"    [OCR] 开始 OCR：{pdf_path.name}")
+            # Run OCR first
+            print(f"    [OCR] Starting OCR: {pdf_path.name}")
             ocr_status = ocr_pdf_if_needed(pdf_path, ocr_pdf_path)
             if ocr_status != "ok":
-                print(f"    [OCR FAIL] OCR 失败：{pdf_path.name}")
+                print(f"    [OCR FAIL] OCR failed: {pdf_path.name}")
                 writer.writerow([
                     rel_bank_dir,
                     pdf_path.name,
@@ -262,19 +263,19 @@ def main():
                     "fail",
                 ])
                 continue
-            print(f"    [OCR OK] 输出 OCR pdf：{ocr_pdf_path}")
+            print(f"    [OCR OK] OCR PDF written: {ocr_pdf_path}")
 
-            # 抽取文本
-            print(f"    [TXT] 开始抽取文本：{pdf_path.name}")
-            txt_ok = extract_text(ocr_pdf_path, txt_path)  # ✅ 只传两个参数
+            # Extract text
+            print(f"    Extracting text: {pdf_path.name}")
+            txt_ok = extract_text(ocr_pdf_path, txt_path)  
             txt_status = "ok" if txt_ok else "fail"
 
             if txt_ok:
-                print(f"    [TXT OK] 输出 txt：{txt_path}")
+                print(f"    [TXT OK] Text file written: {txt_path}")
             else:
-                print(f"    [TXT FAIL] 文本抽取失败：{txt_path}")
+                print(f"    [TXT FAIL] Text extraction failed: {txt_path}")
 
-            # 统一写日志
+            # Write one structured log row per processed PDF (success or failure).
             writer.writerow([
                 rel_bank_dir,
                 pdf_path.name,

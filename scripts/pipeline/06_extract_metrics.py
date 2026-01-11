@@ -1,8 +1,20 @@
-# rag_chat_2024_ollama.py
-# pip install -U faiss-cpu sentence-transformers numpy requests
+"""
+Extract financial metrics (NII, NIM, ROA, ROE, Provision for Credit Losses) from bank annual reports / 10-K.
+
+Workflow:
+- Load FAISS index + meta.jsonl built from OCR text chunks
+- Retrieve evidence chunks (multi-query + optional neighbor expansion)
+- Build an evidence context string for LLM extraction
+- Parse/normalize model output into a stable tabular schema and write CSV
+
+Notes:
+- This script assumes the index and meta files already exist under data/interim/index/.
+- Ollama must be running locally when LLM extraction is enabled.
+"""
 AUDIT_ROWS = []
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# Constrain CPU threads to reduce oversubscription and improve run-to-run stability (FAISS / BLAS).
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -26,8 +38,12 @@ from sentence_transformers import SentenceTransformer
 import sys
 
 def find_repo_root(start: Path) -> Path:
+    """
+    Return the repository root directory.
+    This resolves the project root used for consistent relative-path handling across scripts.
+    """
     p = start.resolve()
-    for _ in range(10):  # 最多向上找 10 层
+    for _ in range(10):  # Search up to 10 parent directories for repo root markers
         if (p / ".git").exists() or (p / "README.md").exists() or (p / "data").exists():
             return p
         p = p.parent
@@ -46,16 +62,20 @@ META_PATH  = INDEX_DIR / "meta.jsonl"
 EMB_MODEL = "BAAI/bge-m3"
 EMB_DEVICE = "cuda"
 
-TOPK_SEARCH = 50   # 先从全库取更大的候选，新增
-TOPK_FINAL  = 20   # 再过滤到同一家 bank 后取前 10，新增/20260106修改为20
+TOPK_SEARCH = 50   # Initial retrieval size from the full index (before bank filtering)
+TOPK_FINAL  = 20   # Final number of chunks kept after filtering by bank
 
 TOPK = 10
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen3:4b"   # 改成你 ollama list 里存在的
+OLLAMA_MODEL = "qwen3:4b"   # Model name must match a local Ollama model (see `ollama list`)
 TEMPERATURE = 0.2
 
 def load_meta(path: Path):
+    """
+    Load FAISS metadata records from meta.jsonl.
+    Returns a list of dict objects, one per indexed chunk, used for bank/stem/chunk lookup and context assembly.
+    """
     meta = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -96,12 +116,13 @@ def build_context(hits):
         # --- head+tail truncate (table-aware) ---
         t = text.lower()
 
-        # 默认截断（短上下文）
+        # Default truncation settings for general text blocks
         MAXC = 1400
         HEAD = 700
         TAIL = 700
 
-        # ✅ 表格/比率表：放宽截断，避免把 2024 数值列截掉
+        # For ratio tables and structured financial summaries, apply a larger context window
+        # to avoid truncating fiscal-year numeric columns (e.g., 2024 values)
         is_ratio_table = any(k in t for k in [
             "selected performance ratios",
             "return on assets",
@@ -118,6 +139,7 @@ def build_context(hits):
         if len(text) > MAXC:
             text = text[:HEAD] + "\n...[middle truncated]...\n" + text[-TAIL:]
 
+# Contract: LLM must copy source_chunk_id exactly from this header for traceability.
         header = f"[k={bank}|stem={stem}|chunk={chunk_id}]"
         blocks.append(
             f"{header}\n"
@@ -129,14 +151,18 @@ def build_context(hits):
 
 
 def ollama_generate(prompt: str) -> str:
+    """
+    Call the Ollama HTTP API and return the raw model response text.
+    This function is intentionally thin: it does not interpret schema, and callers handle JSON parsing/repair.
+    """
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "format": "json",  # ✅ 强制 JSON
+        "format": "json",  # Enforce JSON-formatted output from the LLM 
         "options": {
             "temperature": 0,
-            # ✅ 删掉 ---，避免把输出截断成空 response
+            # Remove stop tokens that may prematurely truncate the model output
             "stop": ["\nQ (empty to exit):"]
         }
     }
@@ -154,7 +180,7 @@ def ollama_generate(prompt: str) -> str:
 
     j = r.json()
 
-    # ✅ 关键：优先 response；为空再用 thinking（你已经有这个逻辑了）
+    # Prefer the 'response' field; fall back to 'thinking' if response is empty
     resp = (j.get("response") or "").strip()
     if resp:
         return resp
@@ -173,14 +199,19 @@ from datetime import datetime
 DEFAULT_RETRIEVAL_QUERY = "FY2024 ROA ROE NIM NII net interest income net interest margin return on assets return on equity provision for credit losses"
 
 def parse_json_loose(s: str):
+    """
+    Parse a JSON-like string with best-effort tolerance.
+    Used to handle common model output issues (extra text, trailing commas, or wrapped JSON).
+    Returns a Python object or None on failure.
+    """
     s = (s or "").strip()
-    # 1) 直接 json.loads
+    # 1) Direct json.loads
     try:
         return json.loads(s)
     except Exception:
         pass
 
-    # 2) 用 raw_decode：从任意位置找到第一个合法 JSON
+    # 2) Use JSONDecoder.raw_decode to locate the first valid JSON object in a mixed string
     dec = json.JSONDecoder()
     for start in range(len(s)):
         if s[start] not in "{[":
@@ -197,21 +228,21 @@ import re, json
 
 def parse_or_fallback(raw_text: str, year: int = 2024):
     """
-    先尝试 parse_json_loose；失败则从“非 JSON 解释性回答”里兜底提取 value + chunk header。
-    返回：
-      - 合规 obj（可能是 {"results":[...]}）
-      - 或扁平 dict {"value": "...", "unit": "...", "source_chunk_id": "...", "fiscal_year": 2024}
+    Try `parse_json_loose` first; if it fails, fall back to regex extraction from non-JSON explanatory outputs.
+    Returns:
+      - A compliant object (e.g., {"results":[...]})
+      - Or a flat dict: {"value": "...", "unit": "...", "source_chunk_id": "...", "fiscal_year": 2024}
     """
     s = (raw_text or "").strip()
 
-    # 1) 正常 JSON
+    # 1) Parse as JSON directly
     try:
         return parse_json_loose(s)
     except Exception:
         pass
 
-    # 2) 尝试从文本里抠一个 JSON 子串（有些模型会先说一堆，再给 { ... }）
-    #    找到第一个 "{" 开始，直到最后一个 "}" 结束
+    # 2) Extract a JSON substring from mixed text (some models produce prose + a JSON object)
+    #    Use the first "{" and the last "}" as a coarse boundary
     l = s.find("{")
     r = s.rfind("}")
     if l != -1 and r != -1 and r > l:
@@ -221,17 +252,17 @@ def parse_or_fallback(raw_text: str, year: int = 2024):
         except Exception:
             pass
 
-    # 3) 彻底不是 JSON：用 regex 兜底抽取 NII（以及 chunk header）
-    #    value: 优先抓 190,591 / 190591 / $190,591 / 190.591 等
+    # 3) Fallback: extract NII and source chunk information from non-JSON model outputs using regex.
+    #    value: prefer numeric patterns like 190,591 / 190591 / $190,591 / 190.591
     m_val = re.search(r"(?i)\bvalue\b[^0-9$]*\$?\s*`?\s*([0-9][0-9,\.]*)", s)
     value = m_val.group(1) if m_val else "NOT FOUND"
     value = value.replace(",", "") if value != "NOT FOUND" else value
 
-    #    unit: 很多时候模型会写 (in thousands) / thousand dollars / million 等；抓不到就 NOT FOUND
+    #    unit: infer scale from phrases like "(in thousands)" / "thousand dollars" / "million"; fallback to NOT FOUND
     m_unit = re.search(r"(?i)\bunit\b[^A-Za-z]*`?\s*([A-Za-z][A-Za-z \-\(\)%]+)", s)
     unit = m_unit.group(1).strip() if m_unit else "NOT FOUND"
 
-    #    chunk: 抓 [k=...|stem=...|chunk=12] 这种；抓不到再退化成纯数字 chunk
+    #    chunk: prefer structured ids like [k=...|stem=...|chunk=12]; fallback to a numeric chunk id when available
     m_cite = re.search(r"(\[k=[^\]]*?\|chunk=\d+\])", s)
     if m_cite:
         source_chunk_id = m_cite.group(1)
@@ -247,6 +278,10 @@ def parse_or_fallback(raw_text: str, year: int = 2024):
     }
 
 def retrieve_hits(index, meta, qvec, topk_search=TOPK_SEARCH, target_bank=None, topk_final=TOPK_FINAL):
+    """
+    Retrieve top hits for a bank using a single retrieval query.
+    This is the baseline retrieval path (single query -> bank-filtered hits), used by higher-level retrieval helpers.
+    """
     D, I = index.search(qvec, topk_search)
 
     hits = []
@@ -256,18 +291,18 @@ def retrieve_hits(index, meta, qvec, topk_search=TOPK_SEARCH, target_bank=None, 
     if not hits:
         return [], None
 
-    # 默认：用 top1 bank 作为目标 bank（你现在就是这么做的 :contentReference[oaicite:1]{index=1}）
+    # Default behavior: use the bank identifier from the top-ranked hit
     if target_bank is None:
         target_bank = hits[0][2].get("bank_folder")
 
-    # 过滤到同一 bank
+    # Keep only hits from the target bank
     hits = [h for h in hits if h[2].get("bank_folder") == target_bank][:topk_final]
     return hits, target_bank
 
 def _prefer_year_hits(hits, year: str):
     """
     hits: list[(rnk, score, meta)]
-    优先保留 stem 含 year 的命中；如果一个都没有，则原样返回（避免全空）
+    Prefer hits whose stem contains the target year; if none match, return the original set to avoid empty evidence.
     """
     y = str(year)
     good = []
@@ -279,12 +314,20 @@ def _prefer_year_hits(hits, year: str):
     return good if good else hits
 
 def _hit_key(h: dict):
+    """
+    Return a stable deduplication key for a hit.
+    Keys are based on (bank_folder/bank, stem, chunk_id) to ensure one evidence block per unique chunk.
+    """
     try:
         return (h.get("bank"), h.get("stem"), int(h.get("chunk_id")))
     except Exception:
         return None
 
 def _build_meta_lookup(meta: list):
+    """
+    Build a lookup table for meta records by (bank, stem, chunk_id).
+    Used to quickly resolve neighbor chunks and to normalize references during context construction.
+    """
     # (bank_folder, stem, chunk_id) -> meta_record
     lookup = {}
     for m in meta:
@@ -298,29 +341,28 @@ def _build_meta_lookup(meta: list):
                 pass
     return lookup
 
-
 def retrieve_hits_multiquery(
     index,
     meta,
     emb,
     target_bank: str,
     year: str,
-    per_metric_topk: int = 10, # 新修改为10，原为30
-    topk_final: int = 20, #新修改为20，原为10
+    per_metric_topk: int = 10, # Reduced per-metric retrieval size for efficiency
+    topk_final: int = 20, # Final number of hits retained after bank filtering
     k0: int = 200,
     kmax: int = 20000,
-    MIN_SCORE = 0.50,  # 相似度阈值，0.52~0.60 之间可调,新修为0.50
+    MIN_SCORE = 0.50,  # Minimum similarity score threshold for enabling filtering
 ):
     """
-    关键改动：
-    - 5 个指标分开检索（更容易命中指标段）
-    - 全库检索 K 自适应翻倍，直到捞到该 bank 的足够 hits
-    - year/stem 过滤优先 2024
+    Key behavior:
+    - Retrieve per metric using metric-specific queries
+    - Adaptively increase K until enough bank-specific hits are obtained
+    - Prefer stems that match the target fiscal year when selecting evidence
     """
 
     def _expand_neighbors(dedup_hits, meta, window=1):
-        # dedup_hits: list[dict] (search_faiss 返回那种)
-        # meta: 你加载的 meta.jsonl 全量列表
+        # dedup_hits: list[dict] in the same schema as FAISS search results
+        # meta: full list loaded from meta.jsonl
         keyset = set()
         out = []
 
@@ -344,7 +386,7 @@ def retrieve_hits_multiquery(
             return (bank, stem, cid)
 
 
-        # 先把原 hit 放进去
+        # Seed with original hits
         for h in dedup_hits:
             k = _key(h)
             if k in keyset:
@@ -352,7 +394,7 @@ def retrieve_hits_multiquery(
             keyset.add(k)
             out.append(h)
 
-        # 建一个快速索引： (bank, stem, chunk_id) -> meta_item
+        # Build a fast index: (bank, stem, chunk_id) -> meta_item
         idx = {}
         for m in meta:
             try:
@@ -363,7 +405,7 @@ def retrieve_hits_multiquery(
             except Exception:
                 continue
 
-        # 给每个 hit 补邻居
+        # Expand each hit by adding neighboring chunks as additional evidence
         for h in list(out):
             bk = h.get("bank") or h.get("bank_folder")
             st = h.get("stem")
@@ -379,7 +421,7 @@ def retrieve_hits_multiquery(
                 m2 = idx.get(nk)
                 if not m2:
                     continue
-                # 伪造一个 hit dict，分数略低一点防止排序乱
+                # Create a synthetic neighboring hit with a slightly reduced score
                 hh = {
                     "bank": bk,
                     "stem": st,
@@ -395,7 +437,8 @@ def retrieve_hits_multiquery(
 
         return out
 
-    # --- robust bank id matching (batch bank_id may not equal meta['bank_folder'] 1:1) ---
+    # Robust bank identifier matching:
+    # batch-level bank_id may not exactly match meta['bank_folder']
     def _norm_bank(s: str) -> str:
         return (s or "").strip().lower()
 
@@ -437,7 +480,7 @@ def retrieve_hits_multiquery(
         "Provision for Credit Losses": f"FY{year} provision for credit losses PCL provision credit losses",
     }
 
-    # 聚合候选（按 chunk 唯一键去重）
+    # Aggregate candidates across per-metric queries, deduplicated by (bank_folder, stem, chunk_id).
     seen = set()
     pooled = []
 
@@ -469,10 +512,10 @@ def retrieve_hits_multiquery(
                 break
             k *= 2
 
-        # year 优先
+        # Prefer hits whose document stem matches the target fiscal year when available.    
         bank_hits = _prefer_year_hits(bank_hits, year)
 
-        # 合并去重（同一个 chunk 只保留一次）
+        # Merge and deduplicate: keep at most one hit per unique chunk key.
         for h in bank_hits:
             m = h[2]
             key = (m.get("bank_folder"), m.get("stem"), m.get("chunk_id"))
@@ -481,28 +524,27 @@ def retrieve_hits_multiquery(
             seen.add(key)
             pooled.append(h)
 
-    # # pooled 里按 score 排一下（score 越大越相关；你这里是 cosine 相似度）
+    # NOTE: We sort by similarity score (higher is more relevant) before final selection.
     # pooled.sort(key=lambda x: x[1], reverse=True)
 
-    # # 最终给 LLM 的证据
+    # Final evidence passed to the LLM (top-k chunks after ranking/filtering).
     # final_hits = pooled[:topk_final]
     # return final_hits
     print("[DEBUG] pooled before bank-filter =", len(pooled), flush=True)
     print("[DEBUG] example bank_folder =", pooled[0][2].get("bank_folder") if pooled else None, flush=True)
 
-    # pooled 里按 score 排一下（score 越大越相关；你这里是 cosine 相似度）
+    # Sort pooled hits by similarity score in descending order (higher cosine similarity = more relevant).
     pooled.sort(key=lambda x: x[1], reverse=True)
 
-    # ===== 新增：相似度阈值过滤（非常重要）=====（202601062040）
+    # Apply similarity score threshold to reduce low-relevance chunks
     filtered = [h for h in pooled if h[1] >= MIN_SCORE]
-    if len(filtered) >= 3:   # 至少保留 3 个证据再启用阈值
+    if len(filtered) >= 3:   # Only enforce MIN_SCORE if it does not collapse evidence (keep at least 3 chunks when possible).
         pooled = filtered
 
-    # 最终给 LLM 的证据
-        # 最终给 LLM 的证据
+    # Final evidence passed to the LLM (top-k after optional thresholding).
     final_hits = pooled[:topk_final]
 
-    # ===== 修复：tuple hit -> dict hit，才能喂给 _expand_neighbors =====
+    # Convert tuple-based hits to dict format for downstream processing
     def _tuple_hit_to_dict(h):
         # h: (rnk, score, meta_dict)
         try:
@@ -531,7 +573,7 @@ def _expand_neighbors(hits, meta, window=1):
     """
     hits: list[dict] from search_faiss() -> {bank, stem, chunk_id, text, score}
     meta: list[dict] loaded from meta.jsonl -> should contain (bank_folder/bank, stem, chunk_id, text)
-    Return: hits + neighbor chunks (±window) per hit, deduped by (bank, stem, chunk_id)
+    Return: hits + neighbor chunks (+/- window) per hit, deduped by (bank, stem, chunk_id)
     """
     if not hits or not meta:
         return hits or []
@@ -677,7 +719,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
                 target_bank = mm.get("bank_folder")  # use the canonical bank_folder
                 break
 
-    # 1) per-metric multi queries（保留你原来的 QUERY_BANK）
+    # 1) Per-metric multi-query retrieval (keep the original QUERY_BANK behavior).
     QUERY_BANK = {
         "NIM": [
             f"{bank_id} net interest margin {year}",
@@ -728,12 +770,15 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
         ],
     }
 
+    # Extract bank identifier from a hit dict (supports multiple key names).
     def _get_hit_bank(h):
         return h.get("bank") or h.get("bank_id") or h.get("k", "")
 
+    # Return a stable dedup key for a hit (prefers chunk_id).
     def _get_hit_key(h):
         return str(h.get("chunk_id") or h.get("id") or h.get("k") or "")
 
+    # Convenience wrapper: parse similarity score as float.
     def _score(h):
         return float(h.get("score", 0.0))
 
@@ -741,7 +786,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
 
     for metric in metrics:
 
-        # ROA/ROE 往往在“Selected Performance Ratios”等表里，embedding 分数会偏低，所以给更大的 topk
+        # ROA/ROE often appear in "Selected Performance Ratios" tables; similarity scores can be lower, so we widen retrieval and relax thresholds.
         topk_per_query_eff = topk_per_query + 20 if metric in ("ROA", "ROE") else topk_per_query
         topk_per_metric_eff = 40 if metric in ("ROA", "ROE") else topk_per_metric
         min_score_eff = (min_score - 0.03) if metric in ("ROA", "ROE") else min_score
@@ -753,7 +798,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
             if hits:
                 pooled.extend(hits)
 
-        # ✅ bank filter：用容错 match（关键修复点）
+        # Bank filter uses tolerant matching to handle minor bank_folder/bank_id formatting differences.
         pooled = [h for h in pooled if _bank_match(_get_hit_bank(h), target_bank)]
 
         strong = [h for h in pooled if _score(h) >= min_score_eff]
@@ -783,8 +828,13 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
 
     return out
 
+# Prompt enforces an output schema. Downstream normalization assumes this contract; parsing includes a fallback for non-compliant outputs.
 def make_prompt(q: str, context: str):
-    # 复用你现在的强模板 prompt（逻辑不变 :contentReference[oaicite:2]{index=2}）
+    """
+    Build the strict JSON-only extraction prompt for a single metric.
+    The prompt enforces: extract only explicit values from context, no inference, and strict citation copying.
+    """
+    # Full strict prompt for multi-metric extraction
     return (
         "You are a financial information extraction engine.\n\n"
         "Task: Extract metrics ONLY if explicitly stated as numbers in the Context.\n"
@@ -814,6 +864,10 @@ def make_prompt(q: str, context: str):
 
 
 def make_prompt_loose(context: str):
+    """
+    Build a slightly more tolerant extraction prompt.
+    Used when strict prompting is too brittle; still requires JSON-only output and prohibits inference.
+    """
     return (
         "You are a financial metric extractor.\n"
         "Return ONLY a JSON object. No extra text.\n"
@@ -853,6 +907,10 @@ def make_prompt_loose(context: str):
     )
 
 def make_repair_prompt(bad_json_text: str, year: int = 2024) -> str:
+    """
+    Build a prompt that repairs model output into the required results schema.
+    This is used as a second pass when the first LLM response is not valid JSON or not in the expected schema.
+    """
     return (
         "You MUST output ONLY valid JSON. No markdown. No extra text.\n"
         "Convert the previous answer into EXACTLY this schema.\n\n"
@@ -877,6 +935,10 @@ def make_repair_prompt(bad_json_text: str, year: int = 2024) -> str:
 
 
 def make_prompt_multi_metrics(context: str, year: int = 2024) -> str:
+    """
+    Build a prompt to extract multiple metrics in one call.
+    Prefer per-metric extraction for stability; this function exists for experiments and backward compatibility.
+    """
     return (
         "You are a financial metric extractor.\n"
         "Return ONLY a JSON object. No markdown. No extra text.\n\n"
@@ -906,6 +968,10 @@ def make_prompt_multi_metrics(context: str, year: int = 2024) -> str:
 METRICS = ["ROA", "ROE", "NIM", "NII", "Provision for Credit Losses"]
 
 def make_prompt_one_metric(metric: str, context: str, year: int = 2024) -> str:
+    """
+    Build a prompt to extract exactly one metric and return a single-item results list.
+    This aligns the model output with downstream CSV writing (results schema).
+    """
     # metric: "NIM"/"ROA"/"ROE"/"Provision for Credit Losses"
     return (
         "You are a financial metric extraction engine.\n"
@@ -927,6 +993,10 @@ def make_prompt_one_metric(metric: str, context: str, year: int = 2024) -> str:
     )
 
 def make_template(year: int):
+    """
+    Create a default results template for a given fiscal year.
+    All metrics are initialized to NOT FOUND to support merge-in of partial extractions.
+    """
     return {
         "results": [
             {"metric_name": m, "value": "NOT FOUND", "unit": "NOT FOUND", "fiscal_year": year, "source_chunk_id": "NOT FOUND"}
@@ -939,10 +1009,14 @@ import re
 # def _valid_cite(x: str) -> bool:
 #     if not isinstance(x, str):
 #         return False
-#     # 必须像: k=Bank_xxx|stem=xxx|chunk=123
+#           Expected citation format: k=<bank>|stem=<doc>|chunk=<id>.
 #     return bool(re.match(r"^k=.+\|stem=.+\|chunk=\d+$", x.strip()))
 
-def _valid_cite(cid: str) -> bool: # 新增，放宽规则
+def _valid_cite(cid: str) -> bool: # Relaxed validation: accept either full header-style citations or a plain numeric chunk id.
+    """
+    Validate a source_chunk_id value.
+    Accepts either a full header-style citation (k=...|stem=...|chunk=...) or a plain numeric chunk id.
+    """
     if not isinstance(cid, str):
         return False
     cid = cid.strip().strip("[]")
@@ -952,30 +1026,38 @@ def _valid_cite(cid: str) -> bool: # 新增，放宽规则
     )
 
 def is_results_schema(obj) -> bool:
+    """
+    Return True if obj matches the expected {'results': [...]} schema.
+    This is a minimal structural check used to decide whether schema repair is needed.
+    """
     if not isinstance(obj, dict):
         return False
     rs = obj.get("results")
     if not isinstance(rs, list):
         return False
-    # 至少包含一个 dict，且有 metric_name/value 字段（你模板就是这样）
+    # Minimal schema check: at least one dict item with metric_name and value.
     for it in rs:
         if isinstance(it, dict) and ("metric_name" in it) and ("value" in it):
             return True
     return False
 
 def _guess_unit(text: str) -> str:
+    """
+    Infer a unit scale token from nearby text.
+    Returns one of: thousand/million/billion/dollars/NOT FOUND based on common table header conventions.
+    """
     t = (text or "").lower()
 
     # --- NEW: $ heuristic (many tables omit wording but show $) ---
-    # 如果出现 $，但没明确 thousand/million，先给 dollars（后续邻域/头部再细化成 thousand/million）
+    # Heuristic: if '$' appears without an explicit scale (thousand/million), default to 'dollars' and let neighbor/header scans refine it later.
     if "$" in (text or ""):
-        # 先不直接返回 thousand，避免误判；先标记 dollars
-        # 如果文本里同时出现 in thousands/millions，会在下面覆盖
+        # Do not default to 'thousand' to avoid false positives; mark as 'dollars' first.
+        # If an explicit scale (e.g., 'in thousands/millions') appears, it will override this below.
         unit_dollar = "dollars"
     else:
         unit_dollar = None
 
-    # 常见写法： (dollars in thousands) / ($ in thousands) / (in thousands)
+    # Common patterns: "(dollars in thousands)" / "($ in thousands)" / "(in thousands)"
     if re.search(r"\(\s*(?:\$|dollars)?\s*in\s+thousands\s*\)", t) or "in thousands" in t:
         return "thousand"
     if re.search(r"\(\s*(?:\$|dollars)?\s*in\s+millions\s*\)", t) or "in millions" in t:
@@ -989,7 +1071,7 @@ def _guess_unit(text: str) -> str:
     if "amounts in millions" in t or "amounts (in millions)" in t:
         return "million"
 
-    # NEW: 更广一些的表头写法
+    # Broader header patterns for unit inference
     if re.search(r"\b(thousands)\b", t) and ("dollar" in t or "$" in t or "usd" in t):
         return "thousand"
     if re.search(r"\b(millions)\b", t) and ("dollar" in t or "$" in t or "usd" in t):
@@ -1003,10 +1085,10 @@ import re
 
 def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_scan_chars: int = 2200):
     """
-    改进点：
-    1) 不再“命中第一条就 return”，而是收集候选并打分选最佳
-    2) unit 推断更强：当前块 + 邻域块 + context 头部 + 命中位置附近窗口
-    3) 过滤明显伪命中：纯年份、过小金额且附近无 million/billion
+    Improvements:
+    1) Collect multiple candidates and select the best-scoring match instead of returning the first hit
+    2) Stronger unit inference: current chunk + neighbor chunks + context header + local window near the matched span
+    3) Filter obvious false positives: pure years, unrealistically small values without nearby scale indicators
     """
     if not context:
         return None
@@ -1014,7 +1096,7 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
     blocks = re.split(r"\n\n---\n\n", context)
 
     header_pat = re.compile(r"^\[k=.*?\|stem=.*?\|chunk=(\d+)\]", flags=re.M)
-    # 捕捉 NII 数字（允许 $、逗号、括号负数）
+    # Capture NII numeric values (allow $, commas, and parenthesized negatives)
     val_pat = re.compile(
         r"(net\s+interest\s+income|NII)\b.{0,160}?"
         r"(\(?-?\$?\s*\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?|\(?-?\$?\s*\d+(?:\.\d+)?\)?)",
@@ -1022,7 +1104,7 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
     )
 
     def _num(s: str):
-        # 变成 float（去掉 $,逗号,括号）
+        # Normalize to float (strip currency symbols, commas, and parentheses)
         if not s:
             return None
         t = s.strip()
@@ -1038,9 +1120,9 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
             return None
 
     def _scale_from_near(text: str) -> str:
-        """更局部的规模词识别（比 _guess_unit 更贴近命中位置）"""
+        """Infer scale keywords from a local text window near the matched span (more precise than _guess_unit)."""
         t = (text or "").lower()
-        # 常见隐式写法
+        # Common implicit scale patterns (e.g., '$ in thousands', '($000s)').
         if re.search(r"\$\s*in\s*thousands|\$\s*\(?\s*000s?\)?|\bin\s*\$0{3}s\b|\(\s*\$0{3}s?\s*\)", t):
             return "thousand"
         if re.search(r"\$\s*in\s*millions|\bin\s*\$0{6}s\b|\(\s*\$0{6}s?\s*\)", t):
@@ -1069,14 +1151,15 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
             if x is None:
                 continue
 
-            # 过滤年份伪命中：2024/2025
+            # Filter year-like false positives (e.g., 2024/2025)
             if 1900 <= x <= 2100 and abs(x - int(x)) < 1e-9:
                 continue
 
-            # 1) 当前块单位
+            # 1) Unit signals in the current chunk
             unit = _guess_unit(blk)
 
-            # 2) 命中位置附近窗口（非常关键：抓 billion/million 就靠这个）
+            # 2）Local context window around the matched value to infer scale indicators
+            # (e.g., thousand / million / billion)
             span_l = max(0, m.start() - 180)
             span_r = min(len(blk), m.end() + 220)
             near = blk[span_l:span_r]
@@ -1084,7 +1167,7 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
             if unit_near != "NOT FOUND":
                 unit = unit_near
 
-            # 3) 邻域块（表头通常在前面）
+            # 3) Neighbor chunks (table headers often appear earlier)
             if unit in ("NOT FOUND", "dollars"):
                 neigh = "\n\n".join(blocks[max(0, i-neighbor_k): min(len(blocks), i+neighbor_k+1)])
                 unit2 = _guess_unit(neigh)
@@ -1095,7 +1178,7 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
                     if unit2b != "NOT FOUND":
                         unit = unit2b
 
-            # 4) context 头部扫一把（很多表格标题都在前面）
+            # 4) Scan context header (table titles frequently appear near the beginning)
             if unit in ("NOT FOUND", "dollars"):
                 unit3 = _guess_unit(head)
                 if unit3 != "NOT FOUND":
@@ -1105,19 +1188,19 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
                     if unit3b != "NOT FOUND":
                         unit = unit3b
 
-            # 小额过滤：如果 unit 仍然只是 dollars 且数值太小（<1000）且没有逗号，基本就是误命中
-            # 除非附近抓到了 million/billion（那就不算小）
+            # Filter low-confidence matches:
+            # values without scale indicators and below a reasonable monetary threshold
             if unit == "dollars":
                 has_comma = ("," in val)
                 if (not has_comma) and abs(x) < 1000:
-                    # 把它当成低可信候选，但不立刻返回
+                    # Keep as a low-confidence candidate, but do not return immediately.
                     penalty_small = 1
                 else:
                     penalty_small = 0
             else:
                 penalty_small = 0
 
-            # 评分：优先 scale 明确 > 只剩 dollars；优先大数/有逗号；惩罚小额伪命中
+            # Scoring: prefer explicit scale over plain dollars; prefer large/comma-formatted values; penalize small likely false positives.
             score = 0
             if unit in ("thousand", "million", "billion"):
                 score += 100
@@ -1137,8 +1220,6 @@ def try_regex_extract_nii_from_context(context: str, neighbor_k: int = 3, head_s
     candidates.sort(key=lambda z: z[0], reverse=True)
     best = candidates[0]
     return (best[1], best[2], best[3])
-
-
 
 
 def try_regex_extract_nim_from_context(context: str, head_scan_chars: int = 2400):
@@ -1211,8 +1292,6 @@ def try_regex_extract_nim_from_context(context: str, head_scan_chars: int = 2400
     candidates.sort(key=lambda x: (-x[3],))
     val, unit, cid, _ = candidates[0]
     return (val, unit, cid)
-
-
 
 
 def try_regex_extract_roa_roe_from_context(context: str, head_scan_chars: int = 2600):
@@ -1352,11 +1431,13 @@ def try_regex_extract_roa_roe_from_context(context: str, head_scan_chars: int = 
 
 def normalize_extraction(obj, year: int):
     """
-    把模型的各种乱输出，统一规整成标准 {"results":[5条]}.
+    Normalize model outputs into a standard schema:
+    {"results": [...]}
     """
     out = make_template(year)
     
-    # --- PATCH: accept flat extraction like {"value": "...", "source_chunk_id": "..."} ---
+    # Compatibility patch:
+    # accept flat extraction outputs without an explicit 'results' schema
     if isinstance(obj, dict) and ("value" in obj) and ("source_chunk_id" in obj) and ("results" not in obj):
         out = make_template(int(year))
         metric = "NII"
@@ -1377,9 +1458,9 @@ def normalize_extraction(obj, year: int):
 
     # --- end patch ---
 
-    # Case A: 已经是合规 results list
+    # Case A: Already in the expected {'results': [...]} schema.
     if isinstance(obj, dict) and isinstance(obj.get("results"), list) and len(obj["results"]) > 0:
-        # 尽量把它填回 template（按 metric_name 对齐）
+        # Fill into the template when possible by aligning on metric_name.
         by_name = {}
         for it in obj["results"]:
             if not isinstance(it, dict):
@@ -1393,10 +1474,10 @@ def normalize_extraction(obj, year: int):
                 row.update(by_name[name])
         return out
 
-    # Case B: 模型返回的是一个 dict，但没有 results（常见：{"Return on Average Assets":"0.75%"}）
+    # Case B: Model returned a dict without 'results' (common example: {'Return on Average Assets': '0.75%'}).  
     if isinstance(obj, dict):
         keymap = {
-            # 常见同义词/乱 key
+            # Common synonym mappings and non-standard key normalization
             "Return on Average Assets": "ROA",
             "Return on Assets": "ROA",
             "ROAA": "ROA",
@@ -1411,18 +1492,18 @@ def normalize_extraction(obj, year: int):
             "Provision for credit losses": "Provision for Credit Losses",
         }
 
-        # 把这些键值塞到 template 的 value 里（unit/source_chunk_id 还是 NOT FOUND）
+        # Fill the template rows with values from a flat dict output (unit/source_chunk_id may remain NOT FOUND).
         for k, v in obj.items():
             if k in keymap:
                 metric = keymap[k]
                 for row in out["results"]:
                     if row["metric_name"] == metric:
                         row["value"] = str(v)
-                        # unit/source_chunk_id 没证据就先 NOT FOUND
+                        # If there is no supporting evidence for unit/source_chunk_id, keep them as 'NOT FOUND'.
                         break
         return out
 
-    # Case C: 其它情况（解析失败/空/乱七八糟）
+    # Case C: unexpected / unsupported output shape
     
     # --- value/unit cleanup: e.g. "1.99%" + unit="%" -> value="1.99" ---
     for row in out.get("results", []):
@@ -1442,11 +1523,11 @@ def normalize_extraction(obj, year: int):
             if isinstance(row.get("unit"), str) and row["unit"].strip().lower() in ("not applicable", "n/a"):
                 row["unit"] = "NOT FOUND"
 
-# ... 在 normalize_extraction() 返回 out 之前做校验
+# Validate and normalize source_chunk_id before returning
     for row in out["results"]:
         cid = row.get("source_chunk_id", "")
         cid = (cid or "").strip()
-        # 允许模型返回带方括号的也行：把 [ ] 去掉
+        # Allow bracket-wrapped cite IDs and strip surrounding brackets
         if cid.startswith("[") and cid.endswith("]"):
             cid = cid[1:-1].strip()
 
@@ -1478,9 +1559,12 @@ def normalize_extraction(obj, year: int):
 
 def normalize_value_unit(val, unit):
     """
-    - 把 '1.99%' + '%' → ('1.99', '%')
-    - 把 '8.69 %' → ('8.69', '%')
-    - 兜底 NOT FOUND
+    Normalize (value, unit) pairs.
+
+    Examples:
+    - value="1.99%" and unit="%" -> ("1.99", "%")
+    - value="8.69 %" -> ("8.69", "%")
+    - Empty / missing fields -> "NOT FOUND"
     """
     if val is None:
         return "NOT FOUND", unit or "NOT FOUND"
@@ -1499,7 +1583,7 @@ def normalize_value_unit(val, unit):
 
     return s, u
 
-#新增函数，做模糊计算，不是直接抽取数据
+# Helper functions for derived metric computation (non-direct extraction)
 import re
 
 def _to_intish(s: str):
@@ -1598,20 +1682,25 @@ def _parse_vertical_year_table(text: str, section_title: str, year: int, stop_ti
 import re
 
 def _find_first_money_after_label(text: str, labels: list):
+    """
+    Convert a numeric-looking string to an int-like value when safe.
+    Used for cleaning values extracted from text (e.g., removing commas or currency symbols).
+    Returns None if conversion is not reliable.
+    """
     if not text:
         return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # 更严格：优先抓 1,234,567 这种
+    # Stricter pass: prefer comma-formatted large numbers (e.g., 1,234,567).
     money_commas = re.compile(r"(?<!\d)(\(?\$?\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?)(?!\d)")
-    # 兜底抓普通数字，但要过滤年份/百分数
+    # Fallback pass: accept plain numbers, but filter out years and percentages.
     num_plain = re.compile(r"(?<!\d)(\(?\$?\d+(?:\.\d+)?\)?)(?!\d)")
 
     def _clean_to_float(s: str):
         s = s.strip()
         if "%" in s:
             return None
-        # 去 $, 逗号, 括号负数
+        # Normalize by removing '$', commas, and handling parenthesized negatives.
         neg = s.startswith("(") and s.endswith(")")
         s2 = s.replace("$", "").replace(",", "").strip("()")
         try:
@@ -1620,7 +1709,7 @@ def _find_first_money_after_label(text: str, labels: list):
             return None
         if neg:
             v = -v
-        # 过滤年份
+        # Filter out year-like values (e.g., 2023/2024).
         if 1900 <= v <= 2100 and abs(v - int(v)) < 1e-9:
             return None
         return v
@@ -1631,25 +1720,30 @@ def _find_first_money_after_label(text: str, labels: list):
         if not any(lb in lnl for lb in labels_l):
             continue
 
-        # 在本行+后续几行找数（避免只抓到年份）
+        # Search this line and a few subsequent lines to avoid capturing only a nearby year token.
         window = " ".join(lines[i:i+6])
 
-        # 1) 先抓带逗号的大数
+        # (1) Try comma-formatted large numbers first.
         for m in money_commas.finditer(window):
             v = _clean_to_float(m.group(1))
             if v is not None:
                 return v
 
-        # 2) 再兜底抓普通数（但过滤严格）
+        # (2) Then fallback to plain numbers with stricter filtering.
         for m in num_plain.finditer(window):
             v = _clean_to_float(m.group(1))
-            if v is not None and abs(v) >= 1000:  # 额外约束：资产/权益至少应很大
+            if v is not None and abs(v) >= 1000:  # Extra constraint: average assets/equity should be sufficiently large (sanity check).
                 return v
 
     return None
 
 
 def maybe_compute_roa_roe_from_context(final_obj: dict, context: str, year: int):
+    """
+    Optionally compute ROA/ROE from context when explicit values are missing.
+    This function is conservative: it only computes when required inputs are confidently extracted,
+    otherwise it returns None to avoid introducing inferred values into the output table.
+    """
     if not isinstance(final_obj, dict) or "results" not in final_obj:
         return
 
@@ -1670,7 +1764,7 @@ def maybe_compute_roa_roe_from_context(final_obj: dict, context: str, year: int)
     if not (need_roa or need_roe):
         return
 
-    # ✅ 先定义再使用
+    # Define before use (avoid referencing variables prior to assignment).
     def _pick_by_contains(d: dict, must_have: list):
         if not d:
             return None
@@ -1724,7 +1818,7 @@ def maybe_compute_roa_roe_from_context(final_obj: dict, context: str, year: int)
         print(f"[ENH] compute ROA/ROE skipped: net_income={net_income} avg_assets={avg_assets} avg_equity={avg_equity}", flush=True)
         return
 
-    # plausibility guard to avoid bad matches (e.g., bank id / year leaking into avg_assets/equity)
+    # Plausibility checks to prevent invalid financial ratio computation
     try:
         if avg_assets is None or avg_equity is None:
             return None
@@ -1756,16 +1850,21 @@ def maybe_compute_roa_roe_from_context(final_obj: dict, context: str, year: int)
 
 
 def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=DEFAULT_RETRIEVAL_QUERY):
+    """
+    Run metric extraction for a single bank and fiscal year.
+    Pipeline: retrieve evidence -> build context -> regex prefill (where applicable) -> per-metric LLM extraction ->
+    schema repair/normalization -> merge into final results dict.
+    """
     print(f"[EXTRACT] start bank={bank_id} year={year}", flush=True)
-    # 1) 用“检索专用 query”取证据（不要用用户随口问法）
-    target_bank = bank_id  # batch 里你传进来的就是目标 bank
+    # 1) Use retrieval-optimized queries to gather evidence (avoid free-form user phrasing).
+    target_bank = bank_id  # The batch input bank_id is the target bank identifier.
     hits = retrieve_hits_multiquery(
         index=index,
         meta=meta,
         emb=emb,
         target_bank=target_bank,
         year=year,
-        per_metric_topk=10, # 新修改为10，原为30
+        per_metric_topk=10, # Reduced per-metric retrieval size for efficiency
         topk_final=TOPK_FINAL,
         k0=200,
         kmax=20000,
@@ -1788,7 +1887,7 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
 
     context = build_context(hits)
     
-    # ===== DEBUG: save context =====新增
+    # DEBUG: persist the assembled context for inspection and reproducibility.
     debug_dir = ROOT / "data" / "outputs" / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1800,7 +1899,7 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
     print("[EXTRACT] context saved", flush=True)
     # ===== END DEBUG =====
 
-    # ====== 稳定性优先：先 regex 直接从 context 抠 NII ======
+    # Stability-first: prefill NII via regex directly from the context before calling the LLM.
     prefill = {}  # metric_name -> {value/unit/source_chunk_id}
 
     if "NII" in METRICS:
@@ -1855,20 +1954,18 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
             print("[EXTRACT] regex prefill ROE ok", flush=True)
     # ====== END ======
 
-
-
-    # ====== 2) LLM：按指标单独抽取（先稳 NIM，再扩 ROA/ROE/PCL） ======
+    # 2) LLM extraction per metric (stabilize NIM first, then expand to ROA/ROE/PCL).
     debug_dir = ROOT / "data" / "outputs" / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # 先按指标拿证据（每个指标最多 6~8 块，prompt 立刻变短）
+    # Retrieve evidence per metric (cap chunks per metric to keep prompts short).
     hits_by_metric = retrieve_hits_per_metric(
         index=index,
         meta=meta,
         emb=emb,
-        bank_id=target_bank,     # ✅ 改名
+        bank_id=target_bank,     # Explicit naming: pass the target bank id into retrieval.
         year=int(year),
-        metrics=METRICS,         # ✅ 必须传
+        metrics=METRICS,         # Required: enumerate metrics for per-metric retrieval.
         topk_per_query=40,
         topk_per_metric=8,
         min_score=0.50,
@@ -1876,14 +1973,14 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
 
     final = make_template(int(year))
 
-    # 先把 regex prefill（NII / NIM 等）写进去
+    # Apply regex prefills (e.g., NII/NIM) before merging LLM outputs.
     for mname, pobj in prefill.items():
         for row in final["results"]:
             if row["metric_name"] == mname:
                 row.update(pobj)
                 break
 
-    # 只让 LLM 补：NIM / ROA / ROE / PCL（NII 已经 regex 稳了）
+    # Ask the LLM to fill remaining metrics (NIM/ROA/ROE/PCL); NII is considered stable via regex.
     llm_metrics = [m for m in ["NIM", "ROA", "ROE", "Provision for Credit Losses"] if m not in prefill]
 
     for metric in llm_metrics:
@@ -1891,7 +1988,7 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
         if not mhits:
             continue
 
-        # 控制证据块数量，避免超长
+        # Cap the number of evidence blocks to avoid overly long contexts.
         mhits = mhits[:12] if metric in ("ROA", "ROE") else mhits[:8]
         mctx = build_context(mhits)
 
@@ -1923,7 +2020,8 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
 
         obj = parse_or_fallback(raw, year=int(year))
 
-        # schema repair（如果不是 results schema）
+        # Schema repair: if the model output is not in the expected 'results' format, attempt a repair pass.
+        # Some model outputs are non-JSON; repair/fallback keeps the pipeline robust.
         if isinstance(obj, dict) and (not is_results_schema(obj)):
             repair_prompt = make_repair_prompt(raw, year=int(year))
             try:
@@ -1939,14 +2037,14 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
 
         norm = normalize_extraction(obj, int(year))
 
-        # norm 只有 1 条 results（单指标），把它 merge 回 final
+        # If normalization yields a single-item results list (single metric), merge it back into the final results.
         if isinstance(norm, dict) and isinstance(norm.get("results"), list):
             for it in norm["results"]:
                 if not isinstance(it, dict):
                     continue
                 if it.get("metric_name") != metric:
                     continue
-                # 合并到 final
+                # Merge into final results (do not overwrite unrelated metrics).
                 for row in final["results"]:
                     if row["metric_name"] == metric:
                         row.update(it)
@@ -1973,12 +2071,20 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
 import csv
 
 def write_jsonl(path: Path, records):
+    """
+    Append one JSON record per line to a JSONL file.
+    Used for audit/debug outputs to keep a durable trace of per-bank extraction results.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 def flatten_metrics(records):
+    """
+    Flatten a normalized results dict into rows for CSV writing.
+    Outputs the canonical columns used by the pipeline (bank, year, metric_name, value, unit, source_chunk_id).
+    """
     rows = []
     for rec in records:
         meta0 = rec.get("_meta", {})
@@ -1991,7 +2097,7 @@ def flatten_metrics(records):
             unit = item.get("unit")
             val, unit = normalize_value_unit(val, unit)
 
-            # audit: 只记录真的找到值的
+            # Audit logging: record only metrics with a concrete extracted value.
             if not _is_not_found(val):
                 AUDIT_ROWS.append({
                     "bank": bank,
@@ -2014,21 +2120,21 @@ def flatten_metrics(records):
 
 
 def _is_not_found(x):
+    """
+    Return True if a field value represents a missing extraction.
+    Treats empty strings and the sentinel 'NOT FOUND' (case-insensitive) as missing.
+    """
     if x is None:
         return True
     s = str(x).strip().upper()
     return s in ("NOT FOUND", "NOT_FOUND", "")
 
-# def _valid_cite(cid: str) -> bool:
-#     if not isinstance(cid, str):
-#         return False
-#     cid = cid.strip()
-#     if cid.startswith("[") and cid.endswith("]"):
-#         cid = cid[1:-1].strip()
-#     # 你现在 build_context 的 cite 形如：k=Bank|stem=...|chunk=123
-#     return bool(re.match(r"^k=.+\|stem=.+\|chunk=\d+$", cid))
 
 def _extract_stem(cid: str) -> str:
+    """
+    Extract a document stem from a citation or hit payload when present.
+    This is used in diagnostics to detect potential year mismatches and to summarize evidence provenance.
+    """
     if not isinstance(cid, str):
         return ""
     cid = cid.strip()
@@ -2038,6 +2144,10 @@ def _extract_stem(cid: str) -> str:
     return m.group(1) if m else ""
 
 def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
+    """
+    Compute summary statistics over extraction outputs.
+    Produces diagnostics such as hit rate, citation compliance, and year mismatch indicators for QA.
+    """
     rows = []
     cnt = Counter()
 
@@ -2051,7 +2161,7 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
 
             results = obj.get("results", None) if isinstance(obj, dict) else None
 
-            # 分类统计
+            # Aggregate counters by category.
             if err == "NO_HITS":
                 cnt["NO_HITS"] += 1
             elif err:
@@ -2072,7 +2182,7 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
                 })
                 continue
 
-            # 结果是 list
+            # Expected: results is a list of per-metric dict objects.
             if len(results) == 0:
                 cnt["RESULTS_EMPTY"] += 1
 
@@ -2090,11 +2200,11 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
                 if (m in METRICS) and (not _is_not_found(v)):
                     found.append(m)
 
-                # 引用合规统计：只要不是 NOT FOUND，就要求符合 cite 格式
+                # Citation compliance: if source_chunk_id is present (not NOT FOUND), it must match the accepted cite format.
                 if not _is_not_found(cid) and (not _valid_cite(cid)):
                     bad_cite += 1
 
-                # 年份 mismatch：stem 明显是 2023/2022 但你在跑 2024
+                # Year mismatch: document stem suggests a different fiscal year than the requested year.
                 stem = _extract_stem(cid)
                 if stem and (str(year) not in stem) and re.search(r"\b(2020|2021|2022|2023)\b", stem):
                     year_mismatch.append(m or "UNKNOWN")
@@ -2123,7 +2233,7 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
                 "year_mismatch_metrics": ",".join(sorted(set(year_mismatch))),
             })
 
-    # 写 diagnostics.csv
+    # Write diagnostics.csv for summary statistics and QA checks.
     out_csv_path.parent.mkdir(parents=True, exist_ok=True)
     cols = ["bank", "year", "topk", "status", "error", "n_found", "found_metrics", "n_bad_cite", "year_mismatch_metrics"]
     with out_csv_path.open("w", encoding="utf-8", newline="") as fw:
@@ -2132,7 +2242,7 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
         for r in rows:
             w.writerow(r)
 
-    # 终端汇总
+    # Print a terminal summary for quick review.    
     print("\n=== STATS SUMMARY ===", flush=True)
     print(f"[STATS] jsonl: {jsonl_path}", flush=True)
     print(f"[STATS] csv : {out_csv_path}", flush=True)
@@ -2142,6 +2252,10 @@ def analyze_extractions(jsonl_path: Path, out_csv_path: Path, year: int):
 
 
 def write_metrics_csv(path: Path, rows):
+    """
+    Write the final metrics table to CSV.
+    Consumes flattened rows and writes a stable schema for downstream analysis (pivot tables, QA, reporting).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = ["bank", "year", "metric_name", "val", "unit", "source_chunk_id"]
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -2152,6 +2266,10 @@ def write_metrics_csv(path: Path, rows):
 
 
 def main():
+    """
+    CLI entry point for batch extraction and diagnostics commands.
+    Supports interactive inputs and batch file mode; errors are handled to continue processing remaining items.
+    """
     print(f"[INFO] loading faiss: {INDEX_PATH}", flush=True)
     index = faiss.read_index(str(INDEX_PATH))
     print(f"[INFO] ntotal={index.ntotal} dim={index.d}", flush=True)
@@ -2179,7 +2297,7 @@ def main():
                 continue
             bank_file = Path(parts[1].strip())
 
-            # 如果是相对路径，统一相对于项目根目录
+            # If a relative path is provided, resolve it relative to the repository root.
             if not bank_file.is_absolute():
                 bank_file = (ROOT / bank_file).resolve()
 
@@ -2227,7 +2345,7 @@ def main():
 
         
         if q.startswith(":stats"):
-            # 用法：:stats [optional_jsonl_path]
+            # Usage: :stats [optional_jsonl_path]
             parts = q.split(maxsplit=1)
             if len(parts) == 2:
                 jsonl_path = Path(parts[1].strip())
@@ -2291,7 +2409,7 @@ def main():
     "Answer (JSON only):"
 )
 
-            # 只取 3 个证据，避免 ctx 太长
+            # Limit to 3 evidence blocks to keep the context short. 
             context = build_context(hits)
 
             prompt = (
@@ -2329,7 +2447,7 @@ def main():
             print("--- traceback ---", flush=True)
             traceback.print_exc()
             print("---------------", flush=True)
-            # 继续下一轮 input，不要退出
+            # Continue to the next input item instead of exiting on error.
 
 if __name__ == "__main__":
     main()

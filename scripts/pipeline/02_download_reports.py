@@ -1,3 +1,13 @@
+"""
+Download annual report / 10-K PDFs from candidate URLs.
+
+Input: a CSV produced by the entry-page stage, expected to contain:
+- idrssd, username, best_pdf_url, (optional) score, year, pdf_type
+
+Output:
+- PDFs saved under data/raw/pdf_downloads/<pdf_type>/<year>/<bank_id>/
+- A download result CSV with status and local_path
+"""
 import os
 import re
 import math
@@ -12,7 +22,7 @@ import requests
 
 def find_repo_root(start: Path) -> Path:
     p = start.resolve()
-    for _ in range(10):  # 最多向上找 10 层
+    for _ in range(10):  # Search up to 10 parent directories for the project root.
         if (p / ".git").exists() or (p / "README.md").exists() or (p / "data").exists():
             return p
         p = p.parent
@@ -22,22 +32,22 @@ ROOT = find_repo_root(Path(__file__))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ======== 配置区（你只要改这里）========
-# 输入 CSV：可以用你现在那份（有 url / score / pdf_type / year）
+# ========= Configuration =========
+# Input CSV produced by the entry-page stage (expects best_pdf_url and basic metadata columns).
 INPUT_CSV = ROOT/"data"/"interim"/"output"/"log"/"bank_candidate_entry_pages_for_pdf_2rd.csv" 
 
-# 输出结果 CSV（会重写）
+# Output CSV (overwritten on each run).
 OUTPUT_CSV = ROOT/"data"/"interim"/"output"/"log"/"download_results.csv"
 
-# PDF 保存根目录
+# Root directory for downloaded PDFs.
 OUTPUT_ROOT = ROOT/"data"/"raw"/"pdf_downloads"
 
-# 最低下载分数（默认 0 = 不按分数过滤）
+# Minimum score threshold for downloads (0.0 disables score-based filtering).
 MIN_SCORE_FOR_DOWNLOAD = 0.0
 
-# 请求配置
+# HTTP request configuration
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2.0  # 每次失败后 *2
+RETRY_BACKOFF = 2.0  # Exponential backoff multiplier per retry.
 TIMEOUT = 40
 
 HEADERS = {
@@ -50,7 +60,7 @@ HEADERS = {
 }
 
 
-# ======== 工具函数 ========
+# ======== Utility functions ========
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -58,15 +68,15 @@ def ensure_dir(path: str) -> None:
 
 def slugify(text: str, max_len: int = 60) -> str:
     """
-    把银行名 / 用户名这些变成安全的文件名片段。
+    Convert an identifier (e.g., bank name / ID) into a filesystem-safe slug.
     """
     if not isinstance(text, str):
         text = str(text)
 
     text = text.strip()
-    # 把空白和连字符统一
+    # Normalize whitespace into underscores.
     text = re.sub(r"[ \t\n\r]+", "_", text)
-    # 只保留字母数字和少量符号
+    # Retain only alphanumeric characters and a small set of safe symbols.
     text = re.sub(r"[^0-9A-Za-z_\-]+", "", text)
     if not text:
         text = "unknown"
@@ -75,7 +85,7 @@ def slugify(text: str, max_len: int = 60) -> str:
 
 def is_pdf_url(url: str) -> bool:
     """
-    粗判：URL 后缀是不是 pdf
+    Heuristic check for PDF URLs based on the filename suffix.
     """
     if not isinstance(url, str):
         return False
@@ -85,7 +95,7 @@ def is_pdf_url(url: str) -> bool:
 
 def parse_year_from_url_or_text(url: str, extra: str = "") -> Optional[int]:
     """
-    从 URL 或别的文本里抓一个像样的年份（2000~今年+1）
+    Extract a plausible year from URL or auxiliary text (2000 .. current_year+1).
     """
     text = f"{url} {extra}"
     years = re.findall(r"(20\d{2})", text)
@@ -102,14 +112,14 @@ def parse_year_from_url_or_text(url: str, extra: str = "") -> Optional[int]:
     if not years_int:
         return None
 
-    # 一般选最大的那个（最新年报）
+    # Prefer the most recent year found.
     return max(years_int)
 
 
 def classify_pdf_type_from_row(row: pd.Series) -> str:
     """
-    从现有行推断一个大致的 pdf_type，
-    如果 CSV 已经给了 pdf_type 就直接用。
+    Infer a coarse PDF type label from the row content.
+    If pdf_type is already provided in the input CSV, reuse it.
     """
     if "pdf_type" in row and isinstance(row["pdf_type"], str) and row["pdf_type"].strip():
         return row["pdf_type"].strip()
@@ -142,8 +152,11 @@ def download_pdf(
     referer: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
-    负责真正下载 PDF，有重试和简单错误信息。
-    返回 (success, reason)
+    Download a PDF to dest_path with retries.
+
+    Returns:
+        (success, reason): reason is either "ok"/"exists" or an error/warning tag
+        such as http_403, empty_file, non_pdf_content_type:<ct>, exception:<name>.
     """
     if not isinstance(url, str) or not url.strip():
         return False, "empty_url"
@@ -162,10 +175,10 @@ def download_pdf(
             if resp.status_code >= 400:
                 last_err = f"http_{resp.status_code}"
             else:
-                # 简单检查 content-type
+                # Validate Content-Type (best-effort).
                 ct = resp.headers.get("Content-Type", "").lower()
                 if "pdf" not in ct and not is_pdf_url(url):
-                    # 仍然保存，但标记一下
+                    # Still save the response, but record a warning.    
                     last_err = f"non_pdf_content_type:{ct}"
 
                 ensure_dir(os.path.dirname(dest_path))
@@ -174,17 +187,17 @@ def download_pdf(
                         if chunk:
                             f.write(chunk)
 
-                # 写完再简单验证一下文件大小
+                # Verify file size after writing.
                 if os.path.getsize(dest_path) == 0:
                     last_err = "empty_file"
-                    # 删除空文件
+                    # Remove empty file before retrying.
                     try:
                         os.remove(dest_path)
                     except OSError:
                         pass
-                    # 继续重试
+                    # Retry on empty output.
                 else:
-                    # 成功，可能带一个非致命 warning
+                    # Success (may include a non-fatal warning).
                     if last_err and "non_pdf_content_type" in last_err:
                         return True, last_err
                     return True, "ok"
@@ -192,7 +205,7 @@ def download_pdf(
         except Exception as e:
             last_err = f"exception:{e.__class__.__name__}"
 
-        # 失败了，准备下一轮
+        # Backoff before next retry.
         if attempt < MAX_RETRIES:
             time.sleep(delay)
             delay *= RETRY_BACKOFF
@@ -200,42 +213,42 @@ def download_pdf(
     return False, last_err or "unknown_error"
 
 
-# ======== 主逻辑 ========
+# ======== Main pipeline ========
 
 def main():
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     Path(OUTPUT_CSV).parent.mkdir(parents=True, exist_ok=True)
 
     if not os.path.exists(INPUT_CSV):
-        raise FileNotFoundError(f"找不到输入 CSV：{INPUT_CSV}")
+        raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
 
-    print(f"读取输入：{INPUT_CSV}")
+    print(f"Reading input CSV: {INPUT_CSV}")
     df = pd.read_csv(INPUT_CSV)
 
-    # 1）检查必要列：这里已经用的是 best_pdf_url
+    # 1) Validate required columns (best_pdf_url is the canonical URL field).
     for col in ["idrssd", "username", "best_pdf_url"]:
         if col not in df.columns:
-            raise ValueError(f"输入 CSV 缺少必要列：{col}")
+            raise ValueError(f"Input CSV is missing required column: {col}")
 
-    # 2）兼容旧的 status / local_path
+    # 2) Backward compatibility: add optional output columns if missing.
     for col in ["status", "reason", "local_path"]:
         if col not in df.columns:
             df[col] = ""
 
-    # 3）用 best_pdf_url 做真正的 URL 列
+    # 3) Filter rows with non-empty best_pdf_url.
     df["best_pdf_url"] = df["best_pdf_url"].fillna("").astype(str)
     df = df[df["best_pdf_url"].str.strip() != ""].copy()
     df.reset_index(drop=True, inplace=True)
 
-    # 创建一个统一使用的 url 列，后面所有逻辑还用 url 就行
+    # Create a unified "url" column to keep downstream logic stable.
     df["url"] = df["best_pdf_url"]
 
     total = len(df)
-    print(f"有效记录数：{total}")
+    print(f"Valid rows: {total}")
 
     session = requests.Session()
 
-    # 结果列表
+    # Accumulate per-row results.
     results = []
 
     for idx, row in df.iterrows():
@@ -244,11 +257,11 @@ def main():
         url = str(row.get("url", "")).strip()
         score = row.get("score", math.nan)
 
-        # 默认先用原来的 pdf_type / year，如果没有就自动推断
+        # Use pdf_type/year from input when available; otherwise infer from URL/text.
         pdf_type = classify_pdf_type_from_row(row)
         year = row.get("year", None)
 
-        # year 可能是 NaN / float / str
+        # Normalize year types (may be NaN/float/str).
         if isinstance(year, float) and math.isnan(year):
             year = None
         if isinstance(year, str) and not year.strip():
@@ -257,7 +270,7 @@ def main():
         if year is None:
             year = parse_year_from_url_or_text(url) or "unknown"
 
-        # 分数过滤（默认 MIN_SCORE_FOR_DOWNLOAD=0 不过滤）
+        # Score-based filtering (disabled by default when threshold is 0.0)
         status = ""
         reason = ""
         local_path = ""
@@ -279,17 +292,17 @@ def main():
                 status = "skip_low_score"
                 reason = f"score<{MIN_SCORE_FOR_DOWNLOAD}"
             else:
-                # 真正下载
+                # Perform download.
                 dir_name = os.path.join(
                     OUTPUT_ROOT,
                     slugify(str(pdf_type)),
                     str(year),
-                    # 再嵌一层公司名，避免一个目录太多文件
+                    # Add a per-bank subfolder to avoid too many files in a single directory.
                     f"{slugify(str(username))}_{slugify(str(idrssd))}",
                 )
                 ensure_dir(dir_name)
 
-                # 文件名：取 URL 最后段 + idrssd
+                # File name derived from the URL path (best-effort).
                 url_last = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
                 fname_part = url_last.rsplit("/", 1)[-1]
                 fname_base = slugify(fname_part, max_len=80)
@@ -298,13 +311,13 @@ def main():
 
                 dest_path = os.path.join(dir_name, fname_base)
 
-                # 已存在则不重复下载
+                # Skip download if the target file already exists and is non-empty.
                 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                     status = "success"
                     reason = "exists"
                     local_path = dest_path
                 else:
-                    print(f"[{idx+1}/{total}] 下载 {username} | {pdf_type} | {year}")
+                    print(f"[{idx+1}/{total}] Downloading {username} | {pdf_type} | {year}")
                     ok, msg = download_pdf(session, url, dest_path)
                     if ok:
                         status = "success"
@@ -332,7 +345,7 @@ def main():
 
     out_df = pd.DataFrame(results)
     out_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"\n完成。结果已写入：{OUTPUT_CSV}")
+    print(f"\nDone. Results written to: {OUTPUT_CSV}")
     print(out_df["status"].value_counts())
 
 
@@ -340,5 +353,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        print("发生未捕获错误：")
+        print("Unhandled exception:")
         traceback.print_exc()

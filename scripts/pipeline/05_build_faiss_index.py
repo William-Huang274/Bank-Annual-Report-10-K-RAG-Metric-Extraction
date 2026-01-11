@@ -1,5 +1,16 @@
-# merge_to_faiss_2024_full.py
-# pip install -U faiss-cpu numpy tqdm
+"""
+Merge per-file embedding shards into a single FAISS index.
+
+This script:
+- Iterates over embedding shards and their corresponding metadata
+- Validates vector dimensions and alignment with metadata
+- Incrementally adds vectors to a FAISS index in batches
+- Writes a consolidated metadata JSONL with global IDs
+
+Designed for large-scale indexing with bounded memory usage.
+"""
+# Dependencies: faiss (CPU), numpy, tqdm
+# This script is named 05_build_faiss_index.py in the pipeline; older names may exist in archive/history.
 
 from pathlib import Path
 import json, time, csv
@@ -9,8 +20,13 @@ import faiss
 import sys
 
 def find_repo_root(start: Path) -> Path:
+    """
+    Locate the repository root directory.
+    The root is identified by the presence of one of: .git, README.md, or data/.
+    Raises RuntimeError if no root is found within 10 parent levels.
+    """
     p = start.resolve()
-    for _ in range(10):  # 最多向上找 10 层
+    for _ in range(10):  # Search up to 10 parent directories for the project root
         if (p / ".git").exists() or (p / "README.md").exists() or (p / "data").exists():
             return p
         p = p.parent
@@ -30,14 +46,18 @@ INDEX_PATH = OUT_DIR / "faiss.index"
 META_PATH  = OUT_DIR / "meta.jsonl"
 LOG_CSV    = OUT_DIR / "merge_log.csv"
 
-LIMIT_ITEMS = None      # None=全量；也可以设 5 测试
-ADD_BATCH = 20000       # 每次往 faiss add 的向量数（内存够可调大）
+LIMIT_ITEMS = None      # Optional limit on number of items (None for full run) 
+ADD_BATCH = 20000       # Number of vectors added to FAISS per batch
+# Tuning: increase ADD_BATCH for faster indexing (more RAM), decrease for lower peak memory.
 
 
 def iter_items(stage1_root: Path):
     """
-    产出每个 emb 文件及其对应 meta
-    emb__X.npy 对 chunks__X.jsonl，且存在 _DONE__X.ok
+    Yield embedding shards and their corresponding metadata.
+    Expected layout:
+    - emb__X.npy          : embedding vectors
+    - chunks__X.jsonl     : per-chunk metadata
+    - _DONE__X.ok         : completion marker for shard X
     """
     for bank_dir in sorted(stage1_root.glob("*")):
         if not bank_dir.is_dir():
@@ -51,6 +71,7 @@ def iter_items(stage1_root: Path):
 
 
 def count_lines(p: Path) -> int:
+    """Count lines in a text file (streaming; tolerant to encoding errors)."""
     n = 0
     with p.open("r", encoding="utf-8", errors="ignore") as f:
         for _ in f:
@@ -69,16 +90,17 @@ def main():
         print("[WARN] no items found")
         return
 
-    # dim from first
+    # Infer embedding dimension from the first shard
     bank0, stem0, emb0, meta0 = items[0]
     e0 = np.load(emb0, mmap_mode="r")
     dim = int(e0.shape[1])
     print(f"[INFO] dim={dim}  first={bank0}/{stem0} vecs={e0.shape[0]}")
 
-    # 用 cosine (normalize_embeddings=True) 的话，内积=cosine
+    # Use inner product as similarity metric.
+    # When embeddings are L2-normalized, inner product is equivalent to cosine similarity.
     index = faiss.IndexFlatIP(dim)
 
-    # reset outputs
+    # Ensure a clean rerun by removing any existing output artifacts.
     if INDEX_PATH.exists():
         INDEX_PATH.unlink()
     if META_PATH.exists():
@@ -101,12 +123,12 @@ def main():
                 if num_meta != num_vec:
                     raise ValueError(f"meta({num_meta}) != vec({num_vec})")
 
-                # add vectors
+                # Add vectors to the FAISS index in batches
                 for i in range(0, num_vec, ADD_BATCH):
                     batch = np.asarray(emb[i:i+ADD_BATCH], dtype=np.float32)
                     index.add(batch)
 
-                # write meta with global_id + source info
+                # Write metadata with assigned global_id and source provenance
                 with meta_path.open("r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         obj = json.loads(line)
@@ -120,6 +142,7 @@ def main():
 
                 w.writerow([bank_folder, stem, num_vec, num_meta, "ok", ""])
 
+            # Fail-fast per shard, but continue merging other shards to maximize progress in long runs.
             except Exception as e:
                 w.writerow([bank_folder, stem, "", "", "fail", f"{type(e).__name__}: {e}"])
                 continue
