@@ -872,7 +872,6 @@ def main():
             dprint(f"[DEBUG] prompt length = {len(prompt)} chars")
             print("[EXTRACT] calling ollama ...", flush=True)
             from src.rag.llm_extract import _ollama_generate
-            from src.rag.packing import build_context
             ans = _ollama_generate(prompt)
             print("\n=== ANSWER ===", flush=True)
             print(ans.strip(), flush=True)

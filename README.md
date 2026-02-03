@@ -1,226 +1,304 @@
-# Bank Annual Report / 10-K RAG Metric Extraction Pipeline
+# Bank Annual Report / 10-K RAG Metric Extraction (Batch CSV)
 
-> **End-to-end, reproducible pipeline for extracting structured financial metrics from U.S. bank annual reports (10-K / Annual Reports) using OCR, embeddings, FAISS, and local LLMs.**
+Evidence-first RAG pipeline to extract key financial metrics from U.S. community banks’ Annual Reports / 10-K PDFs into a **reproducible CSV**.
 
----
-
-## 1. Project Overview
-
-This project builds a **fully automated, reproducible RAG-style pipeline** to extract key financial metrics from **unstructured bank annual reports** (PDF / HTML), and deliver them as **structured CSV outputs** for downstream analysis.
-
-### Target Metrics (FY2024)
-
-- **Net Interest Income (NII)**
-- **Net Interest Margin (NIM)**
-- **Return on Assets (ROA)**
-- **Return on Equity (ROE)**
-- **Provision for Credit Losses (PCL)**
-
-### Scale & Validation
-
-- **25 U.S. banks**
-- **10-K / Annual Report PDFs (100+ documents)**
-- **End-to-end batch extraction with coverage & sanity checks**
-
-This project is designed as an **engineering system**, not a demo notebook:
-
-- Reproducible directory structure
-- Deterministic batch runs
-- Debug-friendly intermediate artifacts
-- Portable across machines
+This is **not** a chat demo. The primary deliverable is a **batch metrics table** with **evidence traceability** (`source_chunk_id`) and **failure buckets** to support debugging and evaluation.
 
 ---
 
-## 2. Why This Project Exists (Problem Statement)
+## 1. What you get
 
-Bank annual reports are:
+### 1.1 Output artifacts
 
-- Long (200–400 pages)
-- Semi-structured (tables, prose, footnotes)
-- Highly inconsistent across institutions
+- **Final CSVs** (default output directory):
+  - `data/outputs/processed/metrics_2024.csv`
+  - `data/outputs/processed/metrics_2024_tablefilled.csv` (optional)
+  - `data/outputs/processed/metrics_2024_comparison.csv` (optional)
+- **Logs**: `data/outputs/logs/`
+- **Debug dumps** (contexts / intermediate traces): `data/outputs/debug/`
 
-Traditional rule-based parsing is brittle, while naïve LLM prompting:
+### 1.2 Output schema (typical)
 
-- Does not scale
-- Lacks traceability
-- Produces unverifiable results
+Each metric record is stored with:
 
-**Goal:**  
-Build a system that can **reliably extract financial metrics at scale**, with **clear provenance** and **reproducible outputs**.
+- `bank`, `fiscal_year`, `metric`
+- `value`, `unit`
+- `source_chunk_id` (evidence pointer for audit/debug)
+- `failure_reason` (e.g., `value_missing`, `unit_missing`, `semantic_ambiguous`, `no_candidates`, ...)
 
----
+### 1.3 Metrics covered (baseline)
 
-## 3. System Architecture
-
-```text
-PDF / HTML
-   ↓
-OCR & Text Normalization
-   ↓
-Chunking (overlap + metadata)
-   ↓
-Embedding (BGE-M3, GPU)
-   ↓
-FAISS Vector Index
-   ↓
-Multi-Query Retrieval
-   ↓
-Hybrid Extraction
-  ├─ Regex-first (high precision)
-  └─ LLM fallback (contextual metrics)
-   ↓
-Structured CSV Output
-```
-This is a fully offline, batch-oriented pipeline designed for deterministic and reproducible runs.
-
-**Key design choice:**  
-> Batch table extraction → CSV delivery, **not conversational QA**.
+- NII (Net Interest Income)
+- NIM (Net Interest Margin)
+- ROA (Return on Assets)
+- ROE (Return on Equity)
+- PCL (Provision for Credit Losses)
 
 ---
 
-## 4. Key Engineering Decisions
+## 2. System overview (Why this is a RAG/LLM project)
 
-### 4.1 Hybrid Extraction Strategy
+### 2.1 Architecture (Evidence → Retrieval → Context → Extraction)
 
-- **Regex-first** for stable, numeric-heavy metrics (e.g. NII, NIM)
-- **LLM fallback** for contextual or computed metrics (ROA, ROE)
-- Minimizes hallucination and improves determinism
+1. **Chunk & embed** report text (default embedding model: `BAAI/bge-m3`)
+2. **FAISS retrieval** to gather evidence chunks for each metric
+3. **Context packing** to build metric-specific evidence context blocks
+4. **Hybrid extraction (deterministic-first)**:
+   - **Table-first**: parse financial tables and backfill values when available
+   - **Regex fallback**: extract from narrative text when tables miss or are incomplete
+   - **LLM gated fallback / judge (optional)**: used only for hard cases (ambiguity, conflict arbitration, schema repair)
 
-### 4.2 Retrieval Quality over Prompt Engineering
+### 2.2 Design rationale (Deterministic-first + Gated LLM)
 
-- Multi-query expansion per metric
-- Conservative similarity thresholds with fallback
-- Context truncation using **head + tail** strategy to preserve numeric evidence
+For batch financial metric extraction, a naive “LLM-first everywhere” approach is often:
 
-### 4.3 Strict Output Contract
+- expensive at scale,
+- hard to reproduce,
+- difficult to audit (silent failures / hallucinations),
+- brittle when output format drifts.
 
-All outputs are normalized into a fixed schema:
+This repo intentionally uses LLM as a **bounded component**:
 
-```text
-bank | fiscal_year | metric | value | unit | source_chunk_id
+- ambiguity resolution / conflict arbitration,
+- schema-constrained extraction for hard buckets,
+- JSON/schema repair to stabilize downstream ingestion.
+
+This is a common production pattern: **deterministic-first for stability + gated LLM for coverage**.
+
+---
+
+## 3. Pipeline stages (01–06)
+
+- **01** Collect report entry pages
+- **02** Download Annual Report / 10-K PDFs
+- **03** OCR / text extraction → plain text
+- **03a/03b** Table sidecar extraction (structured table artifacts)
+- **04** Build embeddings
+- **05** Build FAISS index
+- **06** Extract metrics (table-first → regex fallback → LLM judge)
+
+---
+
+## 4. Quickstart (Sample index)
+
+The repo includes a **small sample** (1 bank) so you can run an end-to-end smoke test without downloading/OCR-ing large PDFs or rebuilding the full index.
+
+### 4.1 Setup (Windows PowerShell)
+
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install -U pip setuptools wheel
+pip install -e .
 ```
 
-Every extracted value is traceable back to an indexed text chunk.
+> Why a venv? It isolates dependencies (FAISS, PyTorch, sentence-transformers, etc.) so the project is reproducible and won’t conflict with your system Python. If you prefer, you can install into your existing environment—but venv is the safe default.
 
-### 4.4 Local, Controllable Models
+### 4.2 Use the bundled sample index
 
-- **Embeddings:** `BAAI/bge-m3` (GPU-accelerated)
-- **LLM inference:** local Ollama (`qwen3:4b`)
-- No external API dependency → reproducible and cost-free runs
+By default, the extraction script points to the **full** index:
 
----
+- `data/interim/index/faiss_2024_full/`
 
-## 5. Directory Structure
+For the sample smoke test, switch to:
 
-```text
-.
-├─ data/
-│  ├─ input/            # bank lists, entry files
-│  ├─ raw/              # OCR outputs, normalized text
-│  ├─ interim/
-│  │   └─ index/        # FAISS index + metadata
-│  └─ processed/
-│      └─ metrics_2024.csv
-├─ scripts/
-│  ├─ pipeline/         # 01–06 pipeline stages
-│  ├─ debug/            # retrieval & extraction tools
-│  └─ dryrun_validate.py
-├─ outputs/
-│  ├─ logs/
-│  └─ debug/
-├─ run_pipeline.py
-└─ README.md
+- `data/sample/index/faiss_2024_sample/`
+
+**Recommended (edit one line):** in `scripts/pipeline/06_extract_metrics_patched_v2_final.py`, set:
+
+- `INDEX_DIR = ROOT / "data" / "sample" / "index" / "faiss_2024_sample"`
+
+**Optional (only if you added env support):**
+
+```powershell
+$env:FAISS_INDEX_DIR="data/sample/index/faiss_2024_sample"
 ```
 
----
+### 4.3 Run extraction on the sample bank(batch mode, interactive)
 
-## 6. Reproducibility & Smoke Test
+This project supports an interactive batch runner. Start the extractor, then type a
+`.batch` command at the prompt.
 
-### 6.1 To validate the pipeline **without recomputation**:
+1. Prepare a bank list (one per line), e.g. `data/input/banks_one.txt`
 
-```bash
-python scripts/dryrun_validate.py
+2. Start the extractor:
+
+```powershell
+python scripts/pipeline/06_extract_metrics_patched_v2_final.py
+# When you see the prompt (e.g., Q (empty to exit):), run:
+
+#   :batch .\data\input\banks_one.txt
+
+# Press Enter on an empty line to exit.
+
+### Expected outputs
 ```
 
-This checks:
+- `data/outputs/processed/metrics_2024.csv` (final batch table)
+- `data/outputs/debug/` (contexts, raw model outputs, traces for debugging)
+- `data/outputs/logs/` (run logs)
 
-- FAISS index loadability
-- Embedding model availability
-- LLM initialization
-- Output path consistency
+## 5. Full pipeline (from bank website)
 
-### 6.2 Smoke Tests
+The end-to-end pipeline can be reproduced locally. Expect **large** intermediate artifacts if you run this on many banks (PDFs, OCR text, embeddings, index).
 
-The repository includes lightweight smoke tests to verify that core artifacts
-are valid and runnable without re-running the full pipeline.
+### 5.1 Typical run order
 
-#### 6.2.1 Embedding Consistency Check
+```powershell
+python scripts/pipeline/01_collect_entry_pages.py --year 2024
+python scripts/pipeline/02_download_reports.py --year 2024
+python scripts/pipeline/03_ocr_to_text.py --year 2024
 
-Verifies that each embedding shard (`.npy`) contains the same number of vectors
-as its corresponding chunk metadata file (`.jsonl`).
+python scripts/pipeline/03a_extract_tables_from_pdf.py --year 2024
+python scripts/pipeline/03b_extract_tables.py --year 2024
 
-```bash
-python scripts/check/check_embeddings_outputs.py
+python scripts/pipeline/04_build_embeddings.py --year 2024
+python scripts/pipeline/05_build_faiss_index.py --year 2024
+
+python scripts/pipeline/06_extract_metrics_patched_v2_final.py --year 2024
+# When you see the prompt (e.g., `Q (empty to exit):`), run one of:
+#   :batch .\data\input\banks_one.txt
+#   :batch .\data\input\banks_three.txt
+#   :batch .\data\input\banks_25.txt
 ```
 
-Expected output:
-```text
-[DONE] items=<N> bad=0
-```
+### 5.2 What each step produces (high-level)
 
-#### 6.2.2 FAISS Retrieval Sanity Check
+#### 01) Collect entry pages (bank website discovery)
 
-Loads the FAISS index and runs an interactive query loop to inspect top-k matches.
-This test validates index loading, metadata alignment, and embedding inference
-(with automatic CUDA → CPU fallback).
+- Script: `scripts/pipeline/01_collect_entry_pages.py`
+- Purpose: crawl bank sites and score candidate entry pages for **Annual Report / 10-K / Financial Report**.
+- Outputs (typical):
+  - `data/interim/entry_pages/<YEAR>/*.jsonl` (ranked candidates + scores)
+  - `data/outputs/logs/` + `data/outputs/debug/` (timeouts, 403/404, redirects, scoring traces)
 
-```bash
-python scripts/debug/query_faiss.py
-```
+#### 02) Download annual reports / 10-K PDFs
+
+- Script: `scripts/pipeline/02_download_reports.py`
+- Purpose: follow the selected entry page(s) and download report PDFs.
+- Outputs (typical):
+  - `data/raw/pdfs/<YEAR>/<bank_id>/*.pdf`
+  - `data/outputs/logs/` (success/failure reason, final URL, content-type)
+
+#### 03) OCR / parse PDFs to text
+
+- Script: `scripts/pipeline/03_ocr_to_text.py`
+- Purpose: convert PDFs (native text or scanned) into normalized text for chunking.
+- Outputs (typical):
+  - `data/interim/txt/<YEAR>/<bank_id>/...` (extracted text)
+  - `data/outputs/logs/` + `data/outputs/debug/` (OCR stats, failures)
+
+#### 03a/03b) Extract tables (table sidecar)
+
+- Scripts:
+  - `scripts/pipeline/03a_extract_tables_from_pdf.py` (PDF-to-table extraction)
+  - `scripts/pipeline/03b_extract_tables.py` (post-process / consolidate sidecar)
+- Purpose: produce a table sidecar to support **table-first** metric extraction.
+- Outputs (typical):
+  - `data/interim/tables/table_sidecar_<...>.jsonl` (tables per bank / per PDF)
+
+#### 04) Build embeddings
+
+- Script: `scripts/pipeline/04_build_embeddings.py`
+- Purpose: chunk text and compute embeddings (default: `BAAI/bge-m3` on GPU).
+- Outputs (typical):
+  - `data/interim/embeddings/<YEAR>/<bank_id>/embeddings.npy`
+  - `data/interim/embeddings/<YEAR>/<bank_id>/chunks.jsonl` (chunk metadata + text pointers)
+
+#### 05) Build FAISS index
+
+- Script: `scripts/pipeline/05_build_faiss_index.py`
+- Purpose: merge embeddings and build the FAISS index + metadata.
+- Outputs (typical):
+  - `data/interim/index/faiss_<YEAR>_full/faiss.index`
+  - `data/interim/index/faiss_<YEAR>_full/meta.jsonl`
+  - `data/interim/index/faiss_<YEAR>_full/merge_log.csv`
+
+#### 06) Extract metrics (hybrid: table-first → regex fallback → LLM judge)
+
+- Script: `scripts/pipeline/06_extract_metrics_patched_v2_final.py`
+- Purpose: retrieve evidence chunks, extract metrics, and write a **batch CSV** with evidence IDs.
+- Outputs (typical):
+  - `data/outputs/processed/metrics_<YEAR>.csv`
+  - `data/outputs/debug/` (contexts per metric, raw model outputs, repair traces)
+  - `data/outputs/logs/` (run logs)
+
+### 5.3 Index paths (important)
+
+- Default **full** index path (typical):
+  - `data/interim/index/faiss_2024_full/`
+- Sample index path:
+  - `data/sample/index/faiss_2024_sample/`
 
 ---
 
-## 7. Results Summary
+## 6. LLM integration (gated)
 
-- **25 banks processed**
-- **NII / NIM:** stable, high-confidence extraction
-- **ROA / ROE:** improved via prose-first + LLM fallback
-- **CSV outputs ready** for downstream analysis
+LLM is **not** used as the default extractor. It is gated to reduce cost and variance.
 
-This project emphasizes **engineering reliability** over absolute metric completeness.
+Typical use cases:
 
----
+- resolving conflicting candidates (multiple values for one metric),
+- disambiguating definitions (GAAP vs non-GAAP),
+- enforcing output schema (JSON repair / schema-constrained extraction),
+- extracting values from hard narrative cases when deterministic methods fail.
 
-## 8. What This Project Demonstrates
+If you enable LLM fallback:
 
-- Large-scale unstructured document processing
-- Vector retrieval system design (FAISS)
-- Hybrid information extraction (rules + LLMs)
-- Debug-driven ML system development
-- Production-oriented Python project structure
+- ensure your local inference endpoint (e.g., Ollama) is running,
+- keep temperature low for schema stability,
+- prefer short, evidence-bounded prompts (context is packed from retrieved chunks).
 
 ---
 
-## 9. Possible Extensions
+## 7. Evaluation & debugging
 
-- Table structure detection for improved unit inference
-- Reranker integration
-- Multi-year trend extraction
-- Downstream analytics / dashboarding
+### 7.1 Failure buckets (typical)
+
+- `value_missing`: no value found after retrieval + extraction
+- `unit_missing`: value found but unit missing (often in table header / neighbor chunks)
+- `semantic_ambiguous`: multiple candidates / definition mismatch
+- `no_candidates`: retrieval returned no usable evidence
+
+### 7.2 Debugging playbook (recommended)
+
+1. **Evidence exists?**  
+   Check if the metric’s value appears in retrieved contexts.
+2. **Recall sufficient?**  
+   If evidence is missing, improve retrieval (multi-query, rerank, thresholds).
+3. **Parsing correct?**  
+   If evidence exists but not extracted, adjust table parsing / regex patterns / unit inference.
+4. **Conflicts?**  
+   If multiple candidates exist, enable LLM judge path and keep schema constraints strict.
+
+### 7.3 Where to look
+
+- `data/outputs/processed/` — final CSVs
+- `data/outputs/logs/` — runtime logs
+- `data/outputs/debug/` — debug artifacts (retrieval contexts, intermediate dumps)
 
 ---
 
-## 10. Tech Stack
+## 8. Repo policy (Artifacts & Git)
 
-- Python 3.10
-- FAISS (IVF-PQ index for large-scale vector retrieval)
-- sentence-transformers / BGE-M3
-- Ollama (Qwen3-4B)
-- OCR & PDF processing tools
+This repo follows a **lightweight + reproducible demo** policy:
 
-## Project Status
+- Commit: code, configs, and small sample artifacts under `data/sample/...`
+- Do **not** commit: OCR outputs, full embeddings, full FAISS indexes, or other large intermediate artifacts
 
-- Full pipeline implemented and validated
-- Embeddings and FAISS index built for 2024 reports
-- Metrics extraction completed and verified
-- Codebase cleaned, documented, and ready for public review
+---
+
+## 9. Roadmap (upgrade ideas)
+
+- Retrieval: per-metric multi-query + lightweight reranker to improve recall for ROA/ROE/NIM
+- Extraction: stronger unit inference (header/neighbor scan; normalization to consistent units)
+- Learning-based: weak supervision → train reranker or structured extractor for hard buckets
+- Derived metrics: compute ROA/ROE when reports require calculation (avg assets/equity)
+
+---
+
+## 10. Disclaimer
+
+PDFs and reports are owned by their respective publishers.
+This repository contains code and small derived sample artifacts for demonstration and reproducibility.
