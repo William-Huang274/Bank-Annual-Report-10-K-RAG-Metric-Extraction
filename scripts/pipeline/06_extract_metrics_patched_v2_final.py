@@ -108,6 +108,7 @@ def dprint(*args, **kwargs):
 # Target fiscal year (string for path building; cast to int only when writing schema fields).
 YEAR = "2024"
 
+# To use sample index, please change INDEX_DIR = ROOT / "data" / "sample" / "index" / f"faiss_{YEAR}_sample"
 INDEX_DIR = ROOT / "data" / "interim" / "index" / f"faiss_{YEAR}_full"
 INDEX_PATH = INDEX_DIR / "faiss.index"
 META_PATH  = INDEX_DIR / "meta.jsonl"
