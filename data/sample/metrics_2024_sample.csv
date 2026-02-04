@@ -1,0 +1,41 @@
+bank,year,metric_name,val,unit,source_chunk_id,bucket
+1stSourceBank_991340,2024,NII,"$ 20,393",thousand,k=1stSourceBank_991340|stem=c9dcb045-d5d8-481a-879f-524e37608ef2pdf|chunk=124,ok
+1stSourceBank_991340,2024,NIM,3.5,%,[k=1stSourceBank_991340|stem=c9dcb045-d5d8-481a-879f-524e37608ef2pdf|chunk=122],ok
+1stSourceBank_991340,2024,Provision for Credit Losses,"12,466",thousand,[k=1stSourceBank_991340|stem=c9dcb045-d5d8-481a-879f-524e37608ef2pdf|chunk=203],ok
+1stSourceBank_991340,2024,ROA,1.52,%,[k=1stSourceBank_991340|stem=c9dcb045-d5d8-481a-879f-524e37608ef2pdf|chunk=23],ok
+1stSourceBank_991340,2024,ROE,12.54,%,[k=1stSourceBank_991340|stem=c9dcb045-d5d8-481a-879f-524e37608ef2pdf|chunk=23],ok
+AmerantBank_83638,2024,NII,"-1,137",thousand,k=AmerantBank_83638|stem=d920016darspdf|chunk=248,ok
+AmerantBank_83638,2024,NIM,3.58,%,[k=AmerantBank_83638|stem=d920016darspdf|chunk=221],ok
+AmerantBank_83638,2024,Provision for Credit Losses,"60,460",thousand,[k=AmerantBank_83638|stem=d920016darspdf|chunk=430],ok
+AmerantBank_83638,2024,ROA,0.16,%,[k=AmerantBank_83638|stem=d920016darspdf|chunk=236],ok
+AmerantBank_83638,2024,ROE,1.99,%,[k=AmerantBank_83638|stem=d920016darspdf|chunk=236],ok
+CPBHawaii_701062,2024,NII,"$ 211,733",thousand,k=CPBHawaii_701062|stem=CPF-12-31-24-10-K-FINALpdf|chunk=294,ok
+CPBHawaii_701062,2024,NIM,4.9,%,[k=CPBHawaii_701062|stem=CPF-12-31-24-10-K-FINALpdf|chunk=170],ok
+CPBHawaii_701062,2024,Provision for Credit Losses,9.8,million,[k=CPBHawaii_701062|stem=CPF-12-31-24-10-K-FINALpdf|chunk=83],ok
+CPBHawaii_701062,2024,ROA,0.78,%,[k=CPBHawaii_701062|stem=CPF-12-31-24-10-K-FINALpdf|chunk=153],ok
+CPBHawaii_701062,2024,ROE,0.72,%,[k=CPBHawaii_701062|stem=CPF-12-31-24-10-K-FINALpdf|chunk=153],ok
+CSBBank_189129,2024,NII,"36,853",thousand,k=CSBBank_189129|stem=CSB_2024_AnnualReport_Final_3-5-25_Proofpdf|chunk=20,ok
+CSBBank_189129,2024,NIM,5.19,%,[k=CSBBank_189129|stem=CSB_2024_AnnualReport_Final_3-5-25_Proofpdf|chunk=21],ok
+CSBBank_189129,2024,Provision for Credit Losses,1.1,million,[k=CSBBank_189129|stem=CSB_2024_AnnualReport_Final_3-5-25_Proofpdf|chunk=20],ok
+CSBBank_189129,2024,ROA,0.85,%,[k=CSBBank_189129|stem=CSB_2024_AnnualReport_Final_3-5-25_Proofpdf|chunk=20],ok
+CSBBank_189129,2024,ROE,8.96,%,[k=CSBBank_189129|stem=CSB_2024_AnnualReport_Final_3-5-25_Proofpdf|chunk=20],ok
+CommerceBank_601050,2024,NII,"$ 45,035",million,k=CommerceBank_601050|stem=2024-Commerce-Bank-Annual-Report-10kpdf|chunk=139,ok
+CommerceBank_601050,2024,NIM,3.47,%,[k=CommerceBank_601050|stem=2024-Commerce-Bank-Annual-Report-10kpdf|chunk=118],ok
+CommerceBank_601050,2024,Provision for Credit Losses,"32,903",thousand,[k=CommerceBank_601050|stem=2024-Commerce-Bank-Annual-Report-10kpdf|chunk=273],ok
+CommerceBank_601050,2024,ROA,1.72,%,[k=CommerceBank_601050|stem=2024-Commerce-Bank-Annual-Report-10kpdf|chunk=121],ok
+CommerceBank_601050,2024,ROE,16.66,%,[k=CommerceBank_601050|stem=2024-Commerce-Bank-Annual-Report-10kpdf|chunk=116],ok
+DeutscheBank_214807,2024,NII,"13,602",million,k=DeutscheBank_214807|stem=Annual-Report-2023pdf|chunk=107,ok
+DeutscheBank_214807,2024,NIM,1.4,%,[k=DeutscheBank_214807|stem=Annual-Report-2023pdf|chunk=104],ok
+DeutscheBank_214807,2024,Provision for Credit Losses,1.5,million,[k=DeutscheBank_214807|stem=Annual-Report-2023pdf|chunk=102],ok
+DeutscheBank_214807,2024,ROA,0.35,%,[k=DeutscheBank_214807|stem=Annual-Report-2023pdf|chunk=728],ok
+DeutscheBank_214807,2024,ROE,8.4,%,table:b0021,table_prefill
+EphrataNational_425911,2024,NII,"$2,702,000,",thousand,k=EphrataNational_425911|stem=2024-ENB-Annual-Report-Completepdf|chunk=114,ok
+EphrataNational_425911,2024,NIM,2.87,%,[k=EphrataNational_425911|stem=2024-ENB-Annual-Report-Completepdf|chunk=71],ok
+EphrataNational_425911,2024,Provision for Credit Losses,"1,015,000",thousand,[k=EphrataNational_425911|stem=2024-ENB-Annual-Report-Completepdf|chunk=114],ok
+EphrataNational_425911,2024,ROA,0.75,%,[k=EphrataNational_425911|stem=2024-ENB-Annual-Report-Completepdf|chunk=5],ok
+EphrataNational_425911,2024,ROE,12.13,%,[k=EphrataNational_425911|stem=2024-ENB-Annual-Report-Completepdf|chunk=116],ok
+FMTrust_289515,2024,NII,NOT FOUND,NOT FOUND,NOT FOUND,value_missing
+FMTrust_289515,2024,NIM,2.95,%,[k=FMTrust_289515|stem=25023FMT-2024-Shareholders-Annual-D-FINAL-WEB-USE-SINGLESpdf|chunk=4],ok
+FMTrust_289515,2024,Provision for Credit Losses,NOT FOUND,NOT FOUND,NOT FOUND,value_missing
+FMTrust_289515,2024,ROA,0.54,%,[k=FMTrust_289515|stem=25023FMT-2024-Shareholders-Annual-D-FINAL-WEB-USE-SINGLESpdf|chunk=4],ok
+FMTrust_289515,2024,ROE,8.05,%,[k=FMTrust_289515|stem=25023FMT-2024-Shareholders-Annual-D-FINAL-WEB-USE-SINGLESpdf|chunk=4],ok
