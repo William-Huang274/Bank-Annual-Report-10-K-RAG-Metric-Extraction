@@ -10,6 +10,7 @@ import json
 import numpy as np
 import faiss
 import sys
+import argparse
 
 def find_repo_root(start: Path) -> Path:
     """
@@ -35,8 +36,9 @@ INDEX_PATH = INDEX_DIR / "faiss.index"
 META_PATH  = INDEX_DIR / "meta.jsonl"
 
 EMB_MODEL = "BAAI/bge-m3"
-
-TOPK = 8
+TOPK = 2000
+TARGET_BANK = "Huntington_Bank_12311"
+TARGET_CHUNK = 170
 
 def load_meta(meta_path: Path):
     """
@@ -88,33 +90,84 @@ def main():
     model, dev = load_st_model(prefer_cuda=True)
 
     # Interactive loop for ad-hoc semantic search against the FAISS index.
-    while True:
-        q = input("\nQuery (empty to exit): ").strip()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", type=str, default=None, help="Run a single query then exit.")
+    ap.add_argument("--topk", type=int, default=TOPK, help="Number of final hits to print.")
+    ap.add_argument("--bank", type=str, default=None, help="Filter hits by bank_folder substring. Default: target bank.")
+    ap.add_argument("--scan-k", type=int, default=5000, help="Initial retrieval size before bank filter.")
+    args = ap.parse_args()
+
+    topk = int(args.topk)
+
+    def run_one(q: str):
+        nonlocal model, dev
+        q = (q or "").strip()
         if not q:
-            break
+            return
 
         try:
             qvec = model.encode([q], batch_size=1, normalize_embeddings=True, convert_to_numpy=True).astype(np.float32)
         except RuntimeError as e:
-            # Encoding may also trigger OOM; perform an explicit CPU fallback and retry once.
             if "out of memory" in str(e).lower():
-                print("[WARN] encode OOM -> switching to cpu")
+                print("[WARN] encode OOM -> switching to cpu", flush=True)
                 model, dev = load_st_model(prefer_cuda=False)
                 qvec = model.encode([q], batch_size=1, normalize_embeddings=True, convert_to_numpy=True).astype(np.float32)
             else:
                 raise
 
-        D, I = index.search(qvec, TOPK)
+        if qvec.ndim == 1:
+            qvec = qvec.reshape(1, -1)
+
+        scan_k = int(args.scan_k)
+
+        # 1) retrieve a larger candidate set
+        D, I = index.search(qvec, scan_k)
+
+        # 2) filter by bank (optional) then take final topk
+        # default to TARGET_BANK so we don't mix other banks unless explicitly requested
+        bank_pat = (args.bank or TARGET_BANK or "").strip().lower()
+        bank_total = (
+            sum(1 for mm in meta if bank_pat in str(mm.get("bank_folder", "")).lower())
+            if bank_pat else len(meta)
+        )
+        hits = []
+
+        for score, idx in zip(D[0], I[0]):
+            m = meta[int(idx)]
+            b = str(m.get("bank_folder", "")).lower()
+            if bank_pat and (bank_pat not in b):
+                continue
+            hits.append((float(score), int(idx), m))
+            if len(hits) >= topk:
+                break
+
+        if len(hits) < topk:
+            print(f"[NOTE] hits={len(hits)} < topk={topk} (scan_k={scan_k}, bank_matches={bank_total})")
 
         print("\n=== TOPK ===")
-        for rank, (score, idx) in enumerate(zip(D[0], I[0]), 1):
-            m = meta[int(idx)]
+        for rank, (score, idx, m) in enumerate(hits, 1):
             text = m.get("text", "")
-            # Print a short preview only to keep console output readable.
             head = text[:300].replace("\n", "\\n")
+            if m.get("bank_folder") == TARGET_BANK and int(m.get("chunk_id", -1)) == TARGET_CHUNK:
+                print(f"[FOUND170] rank={rank} score={score:.4f}")
             print(f"[{rank}] score={score:.4f}  bank={m.get('bank_folder')}  stem={m.get('stem')}  chunk_id={m.get('chunk_id')}")
             print(f"     char=[{m.get('char_start')},{m.get('char_end')}]")
             print(f"     {head}\n")
+
+
+    if args.query is not None:
+        run_one(args.query)
+        return
+
+    while True:
+        try:
+            q = input("\nQuery (empty to exit): ").strip()
+        except EOFError:
+            print("[INFO] stdin is not interactive (EOF). Exit.", flush=True)
+            break
+        if not q:
+            break
+        run_one(q)
 
 if __name__ == "__main__":
     main()

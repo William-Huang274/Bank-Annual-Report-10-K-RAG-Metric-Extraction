@@ -56,6 +56,14 @@ def bucket_from_row(row: Dict) -> str:
     cid = str(cid).strip()
     v = row.get("val")
     u = row.get("unit")
+    review_action = str(row.get("review_action", "")).strip().lower()
+
+    if review_action == "replace":
+        return "llm_review_replaced"
+    if review_action == "reject":
+        return "llm_review_rejected"
+    if review_action == "review_fail":
+        return "llm_review_failed"
 
     if row.get("error"):
         return "pipeline_error"
@@ -112,6 +120,15 @@ def flatten_metrics(records: List[dict], audit_buffer: List[dict] | None = None)
                 "val": val,
                 "unit": unit,
                 "source_chunk_id": cid,
+                "confidence_level": item.get("confidence_level", ""),
+                "needs_review": item.get("needs_review", ""),
+                "confidence_reason": item.get("confidence_reason", ""),
+                "review_action": item.get("review_action", ""),
+                "review_note": item.get("review_note", ""),
+                "orig_val": item.get("orig_value", item.get("orig_val", "")),
+                "orig_unit": item.get("orig_unit", ""),
+                "orig_source_chunk_id": item.get("orig_source_chunk_id", ""),
+                "review_model": item.get("review_model", ""),
             }
             if has_err:
                 row["error"] = rec.get("error") or True
@@ -142,8 +159,10 @@ def merge_keep_existing(old_csv_path: Path, new_rows: List[dict]) -> List[dict]:
     for nr in new_rows:
         k = (nr.get("bank"), str(nr.get("year")), nr.get("metric_name"))
         orow = old_map.get(k)
+        review_action = str(nr.get("review_action", "")).strip().lower()
+        force_review_override = review_action in ("replace", "reject")
 
-        if orow and (not _is_nf(orow.get("val"))):
+        if orow and (not _is_nf(orow.get("val"))) and (not force_review_override):
             kept = {
                 "bank": orow.get("bank"),
                 "year": orow.get("year"),
@@ -151,6 +170,15 @@ def merge_keep_existing(old_csv_path: Path, new_rows: List[dict]) -> List[dict]:
                 "val": orow.get("val"),
                 "unit": orow.get("unit"),
                 "source_chunk_id": orow.get("source_chunk_id"),
+                "confidence_level": orow.get("confidence_level", ""),
+                "needs_review": orow.get("needs_review", ""),
+                "confidence_reason": orow.get("confidence_reason", ""),
+                "review_action": orow.get("review_action", ""),
+                "review_note": orow.get("review_note", ""),
+                "orig_val": orow.get("orig_val", ""),
+                "orig_unit": orow.get("orig_unit", ""),
+                "orig_source_chunk_id": orow.get("orig_source_chunk_id", ""),
+                "review_model": orow.get("review_model", ""),
             }
             kept["bucket"] = bucket_from_row(kept)
             merged_map[k] = kept
@@ -174,7 +202,24 @@ def merge_keep_existing(old_csv_path: Path, new_rows: List[dict]) -> List[dict]:
 
 def write_metrics_csv(path: Path, rows: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cols = ["bank", "year", "metric_name", "val", "unit", "source_chunk_id", "bucket"]
+    cols = [
+        "bank",
+        "year",
+        "metric_name",
+        "val",
+        "unit",
+        "source_chunk_id",
+        "confidence_level",
+        "needs_review",
+        "confidence_reason",
+        "review_action",
+        "review_note",
+        "orig_val",
+        "orig_unit",
+        "orig_source_chunk_id",
+        "review_model",
+        "bucket",
+    ]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

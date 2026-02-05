@@ -205,6 +205,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
             "ROAE return on average equity",
             "return on average shareholders' equity",
             "return on average stockholders' equity",
+            "Return on average common shareholders’ equity",
             "return on avg equity",
             f"Selected Performance Ratios return on equity {year}",
             "Other Data at Year-end Selected Performance Ratios",
@@ -273,6 +274,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
         # so we keep more candidates for these two metrics.
         local_topk_per_query = topk_per_query
         local_topk_per_metric = topk_per_metric
+        local_min_score = min_score
         if metric in ("NII", "NIM"):
             local_topk_per_query = max(int(local_topk_per_query), 160)
             local_topk_per_metric = max(int(local_topk_per_metric), 12)
@@ -283,7 +285,10 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
         # ROA/ROE need deeper retrieval to catch ratio-table blocks like "Financial ratios: Return on average assets ..."
         _topk_q = int(local_topk_per_query)
         if metric in ("ROA", "ROE"):
-            _topk_q = max(_topk_q, 200)   # Increase depth to 200 only for ROA/ROE; leave others unchanged.
+            # Only ROA/ROE: widen candidate pool and lower score gate for evidence rerank.
+            _topk_q = max(_topk_q, 200)
+            local_topk_per_metric = max(int(local_topk_per_metric), 200)
+            local_min_score = min(float(local_min_score), 0.0)
 
         for q in queries:
             pooled.extend(search_faiss(index, meta, emb, q, topk=_topk_q))
@@ -291,34 +296,6 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
         # bank filter + score filter + dedup
         filtered = []
         seen = set()
-        # DEBUG: inspect whether ROA/ROE has near chunks BEFORE min_score gate
-        if metric in ("ROA", "ROE"):
-            near = [
-                (str(h.get("chunk_id")), float(h.get("score", 0.0)))
-                for h in pooled
-                if str(h.get("chunk_id", "")).isdigit()
-                and 260 <= int(h["chunk_id"]) <= 280
-            ]
-            if near:
-                near_sorted = sorted(near, key=lambda x: x[1], reverse=True)[:30]
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("[DEBUG][RETR_PRE_GATE] bank=%s metric=%s near_top=%s total=%d",
-                                target_bank, metric, near_sorted[:10], len(near_sorted))
-
-        # DEBUG: inspect pooled hits before min_score gate
-        if metric in ("ROA", "ROE"):
-            near = [
-                (str(h.get("chunk_id")), float(h.get("score", 0.0)))
-                for h in pooled
-                if str(h.get("chunk_id", "")).isdigit()
-                and 260 <= int(h["chunk_id"]) <= 280
-            ]
-            if near:
-                if logger.isEnabledFor(logging.DEBUG):
-                    near_sorted_all = sorted(near, key=lambda x: x[1], reverse=True)
-                    logger.debug("[DEBUG][RETR_PRE_GATE] metric=%s near_chunks_top=%s total=%d",
-                                metric, near_sorted_all[:10], len(near_sorted_all))
-
         def _kw_hit(metric: str, text: str) -> bool:
             tx = (text or "").lower()
             if metric == "ROA":
@@ -336,7 +313,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
             sc = float(h.get("score", 0.0))
             cid = str(h.get("chunk_id", ""))
 
-            if sc < float(min_score):
+            if sc < float(local_min_score):
                 # DEBUG: see whether ROA/ROE key chunks are dropped by min_score
                 if metric in ("ROA", "ROE") and cid.isdigit():
                     ci = int(cid)
@@ -354,10 +331,19 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
             if len(filtered) >= int(local_topk_per_metric):
                 break
 
+        # DEBUG: inspect hits AFTER bank filter + min_score + keyword ordering
+        if metric in ("ROA", "ROE") and logger.isEnabledFor(logging.DEBUG):
+            top_filtered = [
+                (str(h.get("chunk_id")), float(h.get("score", 0.0)), _get_hit_bank(h))
+                for h in filtered[:10]
+            ]
+            logger.debug("[DEBUG][RETR_POST_GATE] bank=%s metric=%s kept=%d pooled=%d top=%s",
+                        target_bank, metric, len(filtered), len(pooled), top_filtered)
+
         if dropped_dbg and logger.isEnabledFor(logging.DEBUG):
             dropped_dbg.sort(key=lambda x: x[1], reverse=True)
             logger.debug("[DEBUG][RETR_GATE_DROP_SUM] metric=%s dropped=%d min_score=%s top=%s",
-                        metric, len(dropped_dbg), min_score, dropped_dbg[:10])
+                        metric, len(dropped_dbg), local_min_score, dropped_dbg[:10])
 
         # Ensure we keep at least one "ratio table" evidence block for ROA/ROE if present
         if metric in ("ROA", "ROE"):
@@ -375,7 +361,7 @@ def retrieve_hits_per_metric(index, meta, emb, bank_id: str, year: int,
 
             if filtered and (not any(_is_ratio_table_hit(h) for h in filtered)):
                 for h in sorted(pooled, key=lambda x: x.get("score", 0.0), reverse=True):
-                    if h.get("score", 0.0) < float(min_score):
+                    if h.get("score", 0.0) < float(local_min_score):
                         continue
                     if not _bank_match(_get_hit_bank(h), target_bank):
                         continue
@@ -428,6 +414,8 @@ def retrieve_hits_multiquery(
     seen = set()
     for m in metrics:
         for h in by_metric.get(m, []):
+            if not h.get("metric"):
+                h["metric"] = m
             key = (h.get("bank"), h.get("stem"), str(h.get("chunk_id")))
             if key in seen:
                 continue
@@ -489,7 +477,7 @@ def retrieve_hits_multiquery(
             except Exception:
                 continue
             base_score = float(h.get("score", 0.0))
-            metric = h.get("metric")
+            metric = h.get("metric") or m
             for d in range(-int(neighbor_window), int(neighbor_window) + 1):
                 if d == 0:
                     continue
@@ -499,7 +487,7 @@ def retrieve_hits_multiquery(
         must_keep = []
         rest = []
         for h in merged:
-            if h.get("metric") in ("NIM", "NII") and h.get("neighbor_of"):
+            if h.get("metric") in ("NIM", "NII", "ROA", "ROE") and h.get("neighbor_of"):
                 must_keep.append(h)
             else:
                 rest.append(h)
@@ -650,6 +638,23 @@ def rerank_hits_by_metric_keywords(mhits, metric: str):
         for pat in neg_pats:
             if pat.search(t):
                 b -= 0.12
+        # ROA/ROE only: boost ratio rows that include explicit percentage evidence.
+        if metric in ("ROA", "ROE"):
+            tt = t.lower()
+            if metric == "ROA":
+                has_ratio_phrase = (
+                    "return on average total assets" in tt
+                    or "return on average assets" in tt
+                    or "return on assets" in tt
+                )
+            else:
+                has_ratio_phrase = (
+                    "return on average equity" in tt
+                    or "return on equity" in tt
+                )
+            has_percent = re.search(r"\b\d+(?:\.\d+)?\s*%", tt) is not None
+            if has_ratio_phrase and has_percent:
+                b += 0.40
         return b
 
     scored = []

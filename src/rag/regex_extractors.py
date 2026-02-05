@@ -433,6 +433,27 @@ def try_regex_extract_nii_from_context(context: str, year: int | None = None, ne
             return "billion"
         return "NOT FOUND"
 
+    def _year_score(local_text: str, target_year: int) -> int:
+        low = (local_text or "").lower()
+        y = str(int(target_year))
+        score = 0
+
+        if re.search(rf"year\s+ended\s+december\s+31,\s*{y}", low):
+            score += 140
+        if re.search(rf"\bfor\s+{y}\b", low):
+            score += 80
+
+        years = re.findall(r"\b20\d{2}\b", low)
+        if y in years:
+            score += 30
+        if years and (y not in years):
+            score -= 60
+
+        prev_y = str(int(target_year) - 1)
+        if re.search(rf"year\s+ended\s+december\s+31,\s*{prev_y}", low):
+            score -= 140
+        return score
+
     candidates = []
 
     head = context[:head_scan_chars]
@@ -441,12 +462,21 @@ def try_regex_extract_nii_from_context(context: str, year: int | None = None, ne
         m_header = header_pat.search(blk)
         if not m_header:
             continue
-        chunk_id = m_header.group(1)
+        chunk_id = m_header.group("cid")
+
+        next_blk = blocks[i + 1] if (i + 1 < len(blocks)) else ""
+        next_chunk_id = chunk_id
+        if next_blk:
+            m_next = header_pat.search(next_blk)
+            if m_next:
+                next_chunk_id = m_next.group("cid")
 
         # Lookahead: append next 1 block to capture split keyword/value across chunks
         scan_blk = blk
-        if i + 1 < len(blocks):
-            scan_blk = blk + "\n" + blocks[i + 1]
+        if next_blk:
+            scan_blk = blk + "\n" + next_blk
+        boundary = len(blk) + 1
+        before_n = len(candidates)
 
         for m in val_pat.finditer(scan_blk):
             val = (m.group(m.lastindex) or "").strip()
@@ -459,24 +489,15 @@ def try_regex_extract_nii_from_context(context: str, year: int | None = None, ne
             if 1900 <= x <= 2100 and abs(x - int(x)) < 1e-9:
                 continue
 
-            # 1) Unit signals in the current chunk
-            unit = _guess_unit(blk) or _guess_unit(scan_blk)
-            candidates.append((200, val, unit, chunk_id))
+            # Anchor the source cid by match position in lookahead text.
+            in_next = m.start() >= boundary
+            src_chunk_id = next_chunk_id if in_next else chunk_id
+            src_blk = next_blk if (in_next and next_blk) else blk
 
-            # Highlights-table fallback: only run when the block strongly looks like a "selected financial data / ratios" section.
-            if not candidates and _looks_like_highlights(scan_blk):
-                m3 = fallback_pat3.search(scan_blk)
-                if m3:
-                    v1, v2, v3 = m3.group("v1"), m3.group("v2"), m3.group("v3")
-                    picked = _pick_by_year(v1, v2, v3, scan_blk)
-                    x = _num(picked)
-                    if x is not None:
-                        unit = _guess_unit(scan_blk)
-                        candidates.append((300, picked.strip(), unit, chunk_id))
-                        # Debug signal for identifying when the highlights fallback branch is used.
-                        print(f"[DBG][NII_FALLBACK] cid={chunk_id} v1={v1} v2={v2} v3={v3} picked={picked}", flush=True)
+            # 1) Unit signals in the source chunk (fallback to scan block)
+            unit = _guess_unit(src_blk) or _guess_unit(scan_blk)
 
-            # 2）Local context window around the matched value to infer scale indicators
+            # 2) Local context window around the matched value to infer scale indicators
             # (e.g., thousand / million / billion)
             span_l = max(0, m.start() - 180)
             span_r = min(len(scan_blk), m.end() + 220)
@@ -535,7 +556,24 @@ def try_regex_extract_nii_from_context(context: str, year: int | None = None, ne
             elif "interest income" in lab and "net" not in lab:
                 score -= 40
 
-            candidates.append((score, val, unit, chunk_id))
+            yscore = _year_score(near, int(year))
+            score += yscore
+            if yscore <= -140 and (str(int(year)) not in near):
+                continue
+
+            candidates.append((score, val, unit, src_chunk_id))
+
+        # Highlights-table fallback: only run when this block produced no direct label+value candidates.
+        if (len(candidates) == before_n) and _looks_like_highlights(scan_blk):
+            m3 = fallback_pat3.search(scan_blk)
+            if m3:
+                v1, v2, v3 = m3.group("v1"), m3.group("v2"), m3.group("v3")
+                picked = _pick_by_year(v1, v2, v3, scan_blk)
+                x = _num(picked)
+                if x is not None:
+                    unit = _guess_unit(scan_blk)
+                    candidates.append((300, picked.strip(), unit, chunk_id))
+                    print(f"[DBG][NII_FALLBACK] cid={chunk_id} v1={v1} v2={v2} v3={v3} picked={picked}", flush=True)
 
     if not candidates:
         return None
@@ -624,6 +662,7 @@ def try_regex_extract_for_metric(
         return None
 
     if m in ("ROA", "ROE"):
+        LOGGER.debug("[DBG][ROA_ROE_CALL] bank=%s metric=%s len=%d head=%s", bank, m, len(context_text or ""), (context_text or "")[:200].replace("\n"," "))
         got_rr = try_regex_extract_roa_roe_from_context(context_text, year=int(year)) or {}
         if got_rr.get(m):
             val, unit, cid = got_rr[m]
@@ -796,7 +835,7 @@ def try_regex_extract_nim_from_context(context: str, head_scan_chars: int = 2400
         focus_lines = []
         for i, ln in enumerate(lines):
             low = ln.lower()
-            if ("net interest margin" in low) or ("net yield on" in low) or ("net interest spread" in low):
+            if ("net interest margin" in low) or ("net yield on" in low) or ("net interest spread" in low) or re.search(r"\bnim\b", low):
                 focus_lines.append(ln)
                 if i + 1 < len(lines): focus_lines.append(lines[i + 1])
                 if i + 2 < len(lines): focus_lines.append(lines[i + 2])
@@ -846,9 +885,33 @@ def try_regex_extract_nim_from_context(context: str, head_scan_chars: int = 2400
             if not nim_pat.search(ln):
                 continue
 
-            # NEW: reject percent lines for PCL (avoid "2.5% increase" etc.)
+            # SAME-LINE label + % (e.g., "FTE NIM to 3.00%")
             if "%" in ln:
-                continue
+                m_label = re.search(r"(net\s+interest\s+margin|interest\s+margin|nim|net\s+interest\s+spread|net\s+yield)", ln, flags=re.I)
+                if m_label is None:
+                    # no label -> skip same-line path
+                    pass
+                else:
+                    label_pos = m_label.start()
+                    best = None
+                    for mline in pct_pat_any.finditer(ln):
+                        val = mline.group("val")
+                        if not _valid_nim(val):
+                            continue
+                        pos = mline.start()
+                        near = ln[max(0, pos - 15): min(len(ln), pos + len(mline.group(0)) + 15)]
+                        if "$" in near:
+                            continue
+                        if re.search(r"\b(increase|decrease|up|down)\b", ln, re.I) and abs(pos - label_pos) > 12:
+                            continue
+                        if abs(pos - label_pos) > 30:
+                            continue
+                        score = 180 - min(abs(pos - label_pos), 20)
+                        if (best is None) or (score > best[0]):
+                            best = (score, val, "%", cid_blk, ln.strip()[:160])
+                    if best:
+                        candidates.append((best[0], best[1], best[2], best[3]))
+                        LOGGER.debug("[DBG][NIM_SAMELINE] cid=%s picked=%s line=%s", best[3], best[1], best[4])
 
             if "unfunded" in ln or "lending commitment" in ln or "commitments" in ln:
                 continue
@@ -953,6 +1016,7 @@ def try_regex_extract_roa_roe_from_context(context: str, year: int, head_scan_ch
     """
     if not context:
         return {}
+    LOGGER.debug("[DBG][ROA_ROE_ENTER] year=%s head=%s", year, (context or "")[:120].replace("\n"," "))
 
     m = _parse_vertical_year_table(
     context,
@@ -1011,6 +1075,10 @@ def try_regex_extract_roa_roe_from_context(context: str, year: int, head_scan_ch
                 return ln
         return m.group(0).strip()
 
+    def _near_money(text: str, start: int, end: int, window: int = 15) -> bool:
+        seg = text[max(0, start - window): min(len(text), end + window)]
+        return "$" in seg
+
     def _kw_before(kw_pat, text: str, pos: int, max_back: int) -> bool:
         """True if kw_pat occurs shortly BEFORE position pos."""
         last_end = None
@@ -1053,6 +1121,118 @@ def try_regex_extract_roa_roe_from_context(context: str, year: int, head_scan_ch
     best = {}  # metric -> (score, val, unit, cid)
 
     head = context[:head_scan_chars].lower()
+
+    num_pat = re.compile(r"(?<!\d)\d{1,2}(?:\.\d{1,4})?(?!\d)")
+
+    # same-line / label-down ROA/ROE candidates per block
+    blocks = re.split(r"\n\s*---\s*\n", context)
+    for blk in blocks:
+        cid = _header_line(blk)
+        lines_blk = blk.splitlines()
+        for idx, ln in enumerate(lines_blk):
+            lnl = ln.lower()
+            if any(x in lnl for x in ["cet1", "tier", "total capital", "capital ratio", "leverage"]):
+                continue
+
+            # ROA label + nearby
+            if ("return on average assets" in lnl) or ("return on average total assets" in lnl) or re.search(r"\broa\b|\broaa\b", lnl):
+                val = None
+                val_line = ln
+                found_pct = False
+                mp_self = pct_pat.search(ln)
+                if mp_self and not _near_money(ln, mp_self.start(), mp_self.end(), 15):
+                    val = mp_self.group("val")
+                    found_pct = True
+                if val is None:
+                    window = lines_blk[idx + 1: idx + 7]
+                    for w in window:
+                        wl = w.lower()
+                        if any(x in wl for x in ["cet1", "tier", "total capital", "capital ratio", "leverage"]):
+                            continue
+                        mp = pct_pat.search(w)
+                        if mp and not _near_money(w, mp.start(), mp.end(), 15):
+                            val = mp.group("val")
+                            val_line = w
+                            found_pct = True
+                            break
+                if val is None:
+                    window = lines_blk[idx + 1: idx + 7]
+                    for w in window:
+                        wl = w.lower()
+                        if any(x in wl for x in ["cet1", "tier", "total capital", "capital ratio", "leverage"]):
+                            continue
+                        if re.search(r"\b(19|20)\d{2}\b", w):
+                            continue
+                        if re.search(r"\(\s*\d+\s*\)", w):
+                            continue
+                        mn = num_pat.search(w)
+                        if mn:
+                            try:
+                                fv = float(mn.group())
+                            except Exception:
+                                continue
+                            if 0.1 <= fv <= 5:
+                                val = mn.group()
+                                val_line = w
+                                break
+                if val:
+                    sc = 170 if found_pct else 150
+                    prev = best.get("ROA")
+                    if (prev is None) or (sc > prev[0]):
+                        best["ROA"] = (sc, val, "%", cid)
+                    LOGGER.debug("[DBG][ROA_LABEL_DOWN] cid=%s picked=%s label_line=%s val_line=%s",
+                                 cid, val, ln.strip()[:160], val_line.strip()[:160])
+
+            # ROE label + nearby (exclude tangible/ROTCE)
+            if ("return on average equity" in lnl) or ("return on average common shareholders' equity" in lnl) or re.search(r"return on average common shareholders[’'] equity", lnl) or re.search(r"\broe\b|\broae\b", lnl):
+                if ("tangible" in lnl) or ("rotce" in lnl):
+                    continue
+                val = None
+                val_line = ln
+                found_pct = False
+                mp_self = pct_pat.search(ln)
+                if mp_self and not _near_money(ln, mp_self.start(), mp_self.end(), 15):
+                    val = mp_self.group("val")
+                    found_pct = True
+                if val is None:
+                    window = lines_blk[idx + 1: idx + 7]
+                    for w in window:
+                        wl = w.lower()
+                        if any(x in wl for x in ["cet1", "tier", "total capital", "capital ratio", "leverage"]):
+                            continue
+                        mp = pct_pat.search(w)
+                        if mp and not _near_money(w, mp.start(), mp.end(), 15):
+                            val = mp.group("val")
+                            val_line = w
+                            found_pct = True
+                            break
+                if val is None:
+                    window = lines_blk[idx + 1: idx + 7]
+                    for w in window:
+                        wl = w.lower()
+                        if any(x in wl for x in ["cet1", "tier", "total capital", "capital ratio", "leverage"]):
+                            continue
+                        if re.search(r"\b(19|20)\d{2}\b", w):
+                            continue
+                        if re.search(r"\(\s*\d+\s*\)", w):
+                            continue
+                        mn = num_pat.search(w)
+                        if mn:
+                            try:
+                                fv = float(mn.group())
+                            except Exception:
+                                continue
+                            if 2 <= fv <= 30:
+                                val = mn.group()
+                                val_line = w
+                                break
+                if val:
+                    sc = 170 if found_pct else 150
+                    prev = best.get("ROE")
+                    if (prev is None) or (sc > prev[0]):
+                        best["ROE"] = (sc, val, "%", cid)
+                    LOGGER.debug("[DBG][ROE_LABEL_DOWN] cid=%s picked=%s label_line=%s val_line=%s",
+                                 cid, val, ln.strip()[:160], val_line.strip()[:160])
 
     for blk in blocks:
         cid = _header_line(blk)
@@ -1479,3 +1659,151 @@ def _find_first_money_after_label(text: str, labels: list):
 
     return None
 
+def mine_ratio_candidates_from_hits(hits: list, metric: str, year: int) -> list[dict]:
+    """
+    Mine ROA/ROE ratio candidates from *raw retrieval hits* (pre-context-join, pre-truncation).
+
+    Return candidates:
+      {
+        "label": "...",
+        "value": "0.99",
+        "unit": "%",
+        "fiscal_year": 2024,
+        "source_chunk_id": "[k=...|stem=...|chunk=269]"  (or "269")
+        "snippet": "...",
+        "score": 0.71,   # optional: from retrieval score
+      }
+    """
+    metric = (metric or "").strip().upper()
+    if metric not in ("ROA", "ROE"):
+        return []
+
+    def _norm_txt(s: str) -> str:
+        # Normalize OCR apostrophe variants so regex matching is stable.
+        return (s or "").replace("’", "'").replace("`", "'").replace("鈥?", "'")
+
+    # Label patterns (conservative; you can extend later)
+    if metric == "ROA":
+        label_pat = re.compile(r"(return\s+on\s+(average\s+)?(total\s+)?assets|\broa\b|\broaa\b)", re.I)
+        reject_pat = re.compile(r"(rotce|tangible|core\s+rotce|non-?gaap)", re.I)  # avoid wrong “equity-ish” rows
+    else:
+        label_pat = re.compile(
+            r"(return\s+on\s+(average\s+)?(?:(?:common\s+)?(?:shareholders|stockholders)['’]?\s+)?equity|\broe\b|\broae\b)",
+            re.I,
+        )
+        reject_pat = re.compile(r"(rotce|tangible|core\s+rotce|non-?gaap)", re.I)  # avoid ROTCE proxy unless you later allow
+
+    pct_pat = re.compile(r"(?<!\d)(\d{1,2}(?:\.\d{1,4})?)\s*%")
+    num_pat = re.compile(r"(?<!\d)(\d{1,2}(?:\.\d{1,4})?)(?!\d)")
+    year_pat = re.compile(rf"(?<!\d){int(year)}(?!\d)")
+
+    cands = []
+    for h in (hits or []):
+        text = (h.get("text") or "")
+        if not text:
+            continue
+
+        # Build a stable citation header similar to your context blocks
+        bank = h.get("bank") or h.get("bank_folder") or ""
+        stem = h.get("stem") or ""
+        chunk = h.get("chunk_id") if h.get("chunk_id") is not None else h.get("chunk")
+        cid = f"[k={bank}|stem={stem}|chunk={chunk}]" if (bank or stem or chunk is not None) else "NOT FOUND"
+
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            ln_n = _norm_txt(ln)
+            if not ln_n or not label_pat.search(ln_n):
+                continue
+
+            # Reject by label line only; table windows can contain mixed ROE/ROTCE rows.
+            win_lines = lines[i : min(i + 9, len(lines))]
+            win = "\n".join(win_lines)
+            if reject_pat.search(ln_n):
+                continue
+
+            def _ok(val: str) -> bool:
+                try:
+                    fv = float(val)
+                except Exception:
+                    return False
+                if metric == "ROA" and not (0.0 < fv <= 10.0):
+                    return False
+                if metric == "ROE" and not (0.0 < fv <= 40.0):
+                    return False
+                if 1900 <= int(fv) <= 2100:
+                    return False
+                return True
+
+            # Prefer values on the label line itself.
+            same_line_picked = False
+            for m in pct_pat.finditer(ln_n):
+                val = m.group(1)
+                if not _ok(val):
+                    continue
+                cands.append({
+                    "label": ln.strip()[:120],
+                    "value": val,
+                    "unit": "%",
+                    "fiscal_year": int(year),
+                    "source_chunk_id": cid,
+                    "snippet": ln_n[:400],
+                    "score": h.get("score"),
+                })
+                same_line_picked = True
+                break
+            if same_line_picked:
+                continue
+
+            # Table style fallback: some rows have values without '%' (e.g., "10.4 11.2 13.2").
+            for m in num_pat.finditer(ln_n):
+                val = m.group(1)
+                if not _ok(val):
+                    continue
+                cands.append({
+                    "label": ln.strip()[:120],
+                    "value": val,
+                    "unit": "%",
+                    "fiscal_year": int(year),
+                    "source_chunk_id": cid,
+                    "snippet": ln_n[:400],
+                    "score": h.get("score"),
+                })
+                same_line_picked = True
+                break
+            if same_line_picked:
+                continue
+
+            # Prefer year-local window if present (helps on “Selected ratios” tables)
+            win2 = win
+            if year_pat.search(text):
+                # if the whole block contains year, we keep as-is; otherwise still ok
+
+                pass
+
+            for m in pct_pat.finditer(win2):
+                val = m.group(1)
+                if not _ok(val):
+                    continue
+
+                snippet = win2[:800]  # keep short; judge will see a few
+                cands.append({
+                    "label": ln.strip()[:120],
+                    "value": val,
+                    "unit": "%",
+                    "fiscal_year": int(year),
+                    "source_chunk_id": cid,
+                    "snippet": snippet,
+                    "score": h.get("score"),
+                })
+
+    # Light de-dup: same cid+value
+    seen = set()
+    out = []
+    for c in sorted(cands, key=lambda x: (-(x.get("score") or 0), x.get("source_chunk_id",""), x.get("value",""))):
+        k = (c.get("source_chunk_id"), c.get("value"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+
+    return out

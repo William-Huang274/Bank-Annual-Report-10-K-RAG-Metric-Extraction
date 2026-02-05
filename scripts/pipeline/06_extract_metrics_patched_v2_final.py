@@ -39,6 +39,8 @@ import requests
 from sentence_transformers import SentenceTransformer
 import sys
 from src.rag.packing import build_context
+from src.rag.regex_extractors import mine_ratio_candidates_from_hits
+from src.rag.llm_extract import judge_select_candidate, review_all_metrics_after_extract
 
 
 from src.rag.api import (
@@ -61,6 +63,7 @@ from src.rag.api import (
     augment_context_with_avg_balances,
 )
 from src.rag.table_sidecar import load_sidecar_index_multi
+from src.rag.llm_extract import _valid_cite
 
 
 # Repository root inferred from this script location (keeps paths portable across machines).
@@ -327,6 +330,146 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
             return 0 <= x <= 40.0
         return True
 
+    def _to_float_safe(v):
+        try:
+            s = str(v).strip()
+            if not s:
+                return None
+            s = s.replace(",", "").replace("%", "").replace("$", "")
+            if s.startswith("(") and s.endswith(")"):
+                s = "-" + s[1:-1]
+            return float(s)
+        except Exception:
+            return None
+
+    def _norm_cid(c):
+        c = str(c or "").strip()
+        if c.startswith("llm:"):
+            c = c[len("llm:"):].strip()
+        if c.startswith("[") and c.endswith("]"):
+            c = c[1:-1].strip()
+        return c
+
+    def _hit_cid_norm(h):
+        bank_h = h.get("bank") or h.get("bank_folder") or target_bank or ""
+        stem_h = h.get("stem") or ""
+        chunk_h = h.get("chunk_id")
+        if chunk_h is None:
+            chunk_h = h.get("chunk")
+        if chunk_h is None:
+            return ""
+        return f"k={bank_h}|stem={stem_h}|chunk={chunk_h}"
+
+    def _score(h):
+        try:
+            return float(h.get("score"))
+        except Exception:
+            return None
+
+    def _collect_hits_for_conf(metric_name: str, all_ctx: dict) -> list:
+        hits_local = list((((all_ctx or {}).get(metric_name) or {}).get("hits", []) or []))
+        if metric_name in ("ROA", "ROE"):
+            peer = "ROE" if metric_name == "ROA" else "ROA"
+            hits_local.extend((((all_ctx or {}).get(peer) or {}).get("hits", []) or []))
+
+        best = {}
+        for h in hits_local:
+            cidn = _hit_cid_norm(h)
+            if not cidn:
+                continue
+            prev = best.get(cidn)
+            prev_s = _score(prev) if prev is not None else None
+            cur_s = _score(h)
+            if (prev is None) or ((cur_s is not None) and (prev_s is None or cur_s > prev_s)):
+                best[cidn] = h
+        out = list(best.values())
+        out.sort(key=lambda x: (_score(x) if _score(x) is not None else -1.0), reverse=True)
+        return out
+
+    def _keyword_ok(metric_name: str, text: str) -> bool:
+        t = str(text or "").lower()
+        if metric_name == "ROA":
+            return ("return on average" in t and "asset" in t) or ("roa" in t)
+        if metric_name == "ROE":
+            return ("return on average" in t and "equity" in t) or ("roe" in t)
+        return True
+
+    def _assess_confidence(metric_name: str, row: dict, all_ctx: dict) -> dict:
+        hard = []
+        soft = []
+
+        val = row.get("value")
+        unit = row.get("unit")
+        cid = str(row.get("source_chunk_id", "NOT FOUND")).strip()
+
+        if _is_nf(val):
+            hard.append("value_missing")
+        if _is_nf(unit):
+            hard.append("unit_missing")
+        if _is_nf(cid):
+            hard.append("citation_missing")
+        else:
+            cid_chk = _norm_cid(cid)
+            if (not cid_chk.startswith("table:")) and (not cid_chk.startswith("regex:")):
+                if not _valid_cite(cid_chk):
+                    hard.append("citation_invalid")
+
+        fv = _to_float_safe(val)
+        if metric_name == "ROA" and (fv is not None) and not (0.0 <= fv <= 3.0):
+            hard.append("range_roa")
+        if metric_name == "ROE" and (fv is not None) and not (0.0 <= fv <= 40.0):
+            hard.append("range_roe")
+        if metric_name == "NIM" and (fv is not None) and not (0.0 <= fv <= 6.0):
+            hard.append("range_nim")
+
+        hits_local = _collect_hits_for_conf(metric_name, all_ctx)
+        s1 = _score(hits_local[0]) if len(hits_local) >= 1 else None
+        s2 = _score(hits_local[1]) if len(hits_local) >= 2 else None
+
+        matched_hit = None
+        cidn = _norm_cid(cid)
+        if cidn and hits_local:
+            for h in hits_local:
+                if _hit_cid_norm(h) == cidn:
+                    matched_hit = h
+                    break
+
+        s_ref = _score(matched_hit) if matched_hit is not None else s1
+        if s_ref is not None and s_ref < 0.60:
+            soft.append(f"low_score:{s_ref:.3f}")
+        if (s1 is not None) and (s2 is not None) and ((s1 - s2) < 0.015):
+            soft.append(f"small_gap:{(s1 - s2):.3f}")
+        if cid.startswith("llm:"):
+            soft.append("llm_citation")
+        if metric_name in ("ROA", "ROE"):
+            txt = str((matched_hit or {}).get("text") or "")
+            if (not txt) and hits_local:
+                txt = str(hits_local[0].get("text") or "")
+            if not _keyword_ok(metric_name, txt):
+                soft.append("weak_metric_keyword")
+
+        if hard:
+            level = "low"
+            needs_review = "1"
+        elif len(soft) >= 2:
+            level = "low"
+            needs_review = "1"
+        elif len(soft) == 1:
+            level = "medium"
+            needs_review = "0"
+        else:
+            level = "high"
+            needs_review = "0"
+
+        reason = ";".join(hard + soft)[:240]
+        if not reason:
+            reason = "rule_ok"
+        return {
+            "confidence_level": level,
+            "needs_review": needs_review,
+            "confidence_reason": reason,
+        }
+
     # Apply regex prefills (e.g., NII/NIM) before merging LLM outputs.
     for mname, pobj in prefill.items():
         if mname in ("ROA", "ROE", "NIM") and not sanity_check(mname, pobj.get("value"), pobj.get("unit")):
@@ -391,6 +534,45 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
         _get_final_row=_get_final_row,
         _is_nf=_is_nf,
     )
+
+        # 3.5) ROA/ROE judge hook (only when still missing; uses pre-truncation hits_by_metric)
+    for _m in ("ROA", "ROE"):
+        _r = _get_final_row(final, _m)
+        if not _r or not _is_nf(_r.get("value")):
+            continue
+
+        _hits_m = (hits_by_metric or {}).get(_m) or []
+        cands = mine_ratio_candidates_from_hits(_hits_m, _m, int(year))
+
+        dprint(f"[DEBUG][JUDGE_MINE] bank={target_bank} metric={_m} cands={len(cands)}")
+        if not cands:
+            continue
+
+        sel = judge_select_candidate(
+            metric_name=_m,
+            bank=target_bank,
+            year=int(year),
+            candidates=cands,
+            model_name=OLLAMA_MODEL,
+            ollama_base_url=OLLAMA_URL,
+            temperature=0.0,
+            seed=None,
+            timeout_s=90,
+            debug_dir=debug_dir,
+            logger=logger,
+        )
+        dprint(f"[DEBUG][JUDGE_SEL] bank={target_bank} metric={_m} sel={sel}")
+
+        if sel >= 0:
+            picked = cands[sel]
+            _write_if_missing(
+                final,
+                _m,
+                picked.get("value", "NOT FOUND"),
+                picked.get("unit", "NOT FOUND"),
+                picked.get("source_chunk_id", "NOT FOUND"),
+            )
+
     # ---- END TABLE PREFILL ----
 
     # Ask the LLM to fill remaining metrics (NIM/ROA/ROE/PCL); NII is considered stable via regex.
@@ -403,6 +585,20 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
     llm_metrics = list(dict.fromkeys(llm_metrics))
 
     dprint(f"[DEBUG][LLM_GATE] bank={target_bank} llm_metrics={llm_metrics}")
+
+    # Optional switch: skip per-metric LLM fallback and rely on regex/table + unified post-review.
+    if os.getenv("ENABLE_PER_METRIC_LLM_FALLBACK", "0") != "1":
+        print(
+            f"[LLM] per-metric fallback skipped (ENABLE_PER_METRIC_LLM_FALLBACK=0) "
+            f"bank={target_bank} would_call={llm_metrics}",
+            flush=True,
+        )
+        llm_metrics = []
+
+    # enable llm for testing
+    if os.getenv("DISABLE_LLM", "0") == "1":
+        print(f"[LLM] skipped (DISABLE_LLM=1) bank={target_bank} would_call={llm_metrics}", flush=True)
+        llm_metrics = []
 
     for metric in llm_metrics:
         _row0 = _get_final_row(final, metric)
@@ -499,11 +695,118 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
             repair=True,
             logger=logger,
         )
+
+        val = None
+        unit = None
+        cid = None
+        fy = None
+        try:
+            val = item.get("value", item.get("val"))
+            unit = item.get("unit")
+            cid = item.get("source_chunk_id")
+            fy = item.get("fiscal_year", item.get("year"))
+        except Exception:
+            pass
+
+        print(
+            f"[LLM_RET] bank={bank_id} metric={metric} "
+            f"val={val} unit={unit} cid={cid} fy={fy} item_type={type(item).__name__}",
+            flush=True,
+        )
+
         if item:
             for row in final["results"]:
                 if row["metric_name"] == metric:
                     row.update(item)
                     break
+
+    # 4.5) confidence scoring (rule-based) to decide whether review is needed
+    low_conf_metrics = []
+    for row in final.get("results", []):
+        metric = row.get("metric_name")
+        conf = _assess_confidence(metric, row, metric_contexts)
+        row.update(conf)
+        if conf.get("needs_review") == "1":
+            low_conf_metrics.append(metric)
+    low_conf_metrics = list(dict.fromkeys(low_conf_metrics))
+    dprint(f"[DEBUG][CONF] bank={target_bank} low_conf_metrics={low_conf_metrics}")
+
+    # 5) unified post-extraction LLM review (all 5 metrics together)
+    review_changed = 0
+    if os.getenv("DISABLE_LLM_REVIEW", "0") != "1":
+        review_only_low = os.getenv("REVIEW_ONLY_LOW_CONFIDENCE", "1") == "1"
+        metrics_to_review = low_conf_metrics if review_only_low else list(METRICS)
+        if review_only_low and not metrics_to_review:
+            dprint(f"[DEBUG][REVIEW_ALL] skipped bank={target_bank} (no low-confidence metrics)")
+            for row in final.get("results", []):
+                if not row.get("review_action"):
+                    row["review_action"] = "skip_by_confidence"
+                if not row.get("review_note"):
+                    row["review_note"] = "confidence_not_low"
+                row["review_model"] = OLLAMA_MODEL
+            review_out = None
+        else:
+            try:
+                review_num_predict = int(os.getenv("LLM_REVIEW_NUM_PREDICT", "768"))
+            except Exception:
+                review_num_predict = 768
+            if review_num_predict <= 0:
+                review_num_predict = 768
+
+            review_out = review_all_metrics_after_extract(
+                bank=target_bank,
+                year=int(year),
+                final_obj=final,
+                metric_contexts=metric_contexts,
+                meta_rows=meta,
+                model_name=OLLAMA_MODEL,
+                ollama_base_url=OLLAMA_URL,
+                temperature=0.0,
+                seed=None,
+                timeout_s=120,
+                num_predict=review_num_predict,
+                metrics_to_review=metrics_to_review,
+                debug_dir=debug_dir,
+                logger=logger,
+            )
+
+        if review_out:
+            review_ok = bool((review_out or {}).get("ok"))
+            decisions = (review_out or {}).get("decisions", {}) or {}
+            for row in final.get("results", []):
+                metric = row.get("metric_name")
+                d = decisions.get(metric)
+                if not d:
+                    if not row.get("review_action"):
+                        row["review_action"] = "skip_by_confidence"
+                    if not row.get("review_note"):
+                        row["review_note"] = "not_in_review_scope"
+                    row["review_model"] = OLLAMA_MODEL
+                    continue
+
+                action = str(d.get("action", "keep")).strip().lower()
+                note = str(d.get("reason", "")).strip()
+                if not review_ok:
+                    action = "review_fail"
+                    note = note or "review_parse_or_call_failed"
+                row["review_model"] = OLLAMA_MODEL
+                row["review_note"] = note
+                row["review_action"] = action if action in ("keep", "replace", "reject") else "review_fail"
+
+                if action in ("replace", "reject"):
+                    old_val = row.get("value", "NOT FOUND")
+                    old_unit = row.get("unit", "NOT FOUND")
+                    old_cid = row.get("source_chunk_id", "NOT FOUND")
+                    row["orig_value"] = old_val
+                    row["orig_unit"] = old_unit
+                    row["orig_source_chunk_id"] = old_cid
+
+                    row["value"] = d.get("value", "NOT FOUND")
+                    row["unit"] = d.get("unit", "NOT FOUND")
+                    row["source_chunk_id"] = d.get("source_chunk_id", "NOT FOUND")
+                    review_changed += 1
+    else:
+        dprint(f"[DEBUG][REVIEW_ALL] skipped bank={target_bank} (DISABLE_LLM_REVIEW=1)")
 
     # ===== meta =====
     final["_meta"] = {
@@ -513,6 +816,8 @@ def extract_for_bank(index, meta, emb, bank_id=None, year=YEAR, retrieval_query=
         "topk": sum(len(v or []) for v in hits_by_metric.values()),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "prefill": list(prefill.keys()) if prefill else [],
+        "review_changed": review_changed,
+        "low_conf_metrics": low_conf_metrics,
     }
     return final
 
@@ -538,6 +843,8 @@ def _extract_stem(cid: str) -> str:
     if not isinstance(cid, str):
         return ""
     cid = cid.strip()
+    if cid.startswith("llm:"):
+        cid = cid[len("llm:"):].strip()
     if cid.startswith("[") and cid.endswith("]"):
         cid = cid[1:-1].strip()
     m = re.search(r"stem=([^|]+)", cid)

@@ -45,7 +45,7 @@ def enforce_bank_filter(hits: list[dict], bank: str, logger):
 
     if not filtered:
         logger.warning("[BANK_FILTER_EMPTY] expected=%s keep_original=%d", expected, len(hits))
-        return []  # 继续保持止血策略：空就空，不污染
+        return hits  
 
     return filtered
 
@@ -108,7 +108,6 @@ def retrieve_and_build_context_for_bank(
         k0=200,
         kmax=20000,
     )
-    hits = enforce_bank_filter(hits, bank_id, logger)
 
     context = build_context(hits)
 
@@ -130,8 +129,7 @@ def retrieve_and_build_context_for_bank(
         topk_per_metric=20,
         min_score=0.50,
     )
-    for k, lst in list(hits_by_metric.items()):
-        hits_by_metric[k] = enforce_bank_filter(lst or [], bank_id, logger)
+    # keep original (06patch.py) bank matching behavior inside retrieve_hits_per_metric; do not re-filter here
 
     # Helper merge
     def _merge_hits_keep_best(a: list, b: list | None = None, max_keep: int = 50) -> list:
@@ -145,6 +143,38 @@ def retrieve_and_build_context_for_bank(
                 best[cid] = h
         out = sorted(best.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)
         return out[:max_keep]
+
+    def _prepend_hits(primary: list, base: list, max_keep: int = 80) -> list:
+        out = []
+        seen = set()
+        for h in (primary or []) + (base or []):
+            k = (str(h.get("bank") or h.get("bank_folder") or ""), str(h.get("stem") or ""), str(h.get("chunk_id") or ""))
+            if not k[2] or (k in seen):
+                continue
+            seen.add(k)
+            out.append(h)
+            if len(out) >= int(max_keep):
+                break
+        return out
+
+    def _is_roa_roe_compute_anchor(metric_name: str, text: str) -> bool:
+        tx = (text or "").lower()
+        if metric_name == "ROA":
+            return (
+                ("total average assets" in tx)
+                or ("return on average total assets" in tx)
+                or ("average avg average avg" in tx and "assets" in tx)
+            )
+        if metric_name == "ROE":
+            return (
+                ("return on average common shareholders" in tx)
+                or ("return on average equity" in tx)
+                or ("average stockholders" in tx and "equity" in tx)
+                or ("average shareholders" in tx and "equity" in tx)
+                or ("average tangible equity" in tx)
+                or ("roace" in tx)
+            )
+        return False
 
     def _force_add_following_chunks(mhits, meta, base_hit, b, k=12):
         s = base_hit.get("stem")
@@ -241,7 +271,8 @@ def retrieve_and_build_context_for_bank(
         if metric == "NIM":
             mhits = mhits[:16]
         elif metric in ("ROA", "ROE"):
-            mhits = mhits[:20]
+            # Keep a wider candidate set for ROA/ROE so average-balance blocks survive.
+            mhits = mhits[:60]
         else:
             mhits = mhits[:10]
 
@@ -252,7 +283,7 @@ def retrieve_and_build_context_for_bank(
         if metric in ("NII", "NIM"):
             mhits = expand_neighbors_from_meta(mhits, meta, window=3, max_add=60, dprint=dprint)
         else:
-            mhits = expand_neighbors_from_meta(mhits, meta, window=2, max_add=30, dprint=dprint)
+            mhits = expand_neighbors_from_meta(mhits, meta, window=3, max_add=60, dprint=dprint)
 
         MAX_BLOCKS_AFTER_EXPAND = 30
         if len(mhits) > MAX_BLOCKS_AFTER_EXPAND:
@@ -273,6 +304,12 @@ def retrieve_and_build_context_for_bank(
             return "\n\n---\n\n".join(parts)
 
         mhits = rerank_hits_by_metric_keywords(mhits, metric)
+        if metric in ("ROA", "ROE"):
+            # Promote compute anchors (e.g., total average assets / average stockholders equity)
+            # before context capping so these blocks are less likely to be truncated out.
+            anchor_hits = [h for h in mhits if _is_roa_roe_compute_anchor(metric, h.get("text") or "")]
+            if anchor_hits:
+                mhits = _prepend_hits(anchor_hits[:8], mhits, max_keep=max(len(mhits), 40))
         mctx = cap_context_by_blocks(mhits, max_context_chars_per_metric)
 
         (debug_dir / f"{bank_id}_{year}_context_{metric}.txt").write_text(
