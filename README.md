@@ -4,6 +4,22 @@ Evidence-first RAG pipeline to extract key financial metrics from U.S. community
 
 This is **not** a chat demo. The primary deliverable is a **batch metrics table** with **evidence traceability** (`source_chunk_id`) and **failure buckets** to support debugging and evaluation.
 
+## Update (2026-02-05): v1.0 Evidence-Grounded LLM Review
+
+This release upgrades Stage 06 from a single-pass extractor to a two-layer, evidence-bounded decision pipeline.
+
+- **Two LLM calls with different roles**:
+  - Candidate-selection judge (ROA/ROE, only when still missing): select from mined candidates only, no value invention.
+  - Unified post-extraction review (all 5 metrics): `keep` / `replace` / `reject` with citation constraints.
+- **Confidence-gated execution**: only low-confidence rows are actively reviewed by default.
+- **Auditability upgrade**: outputs now include `confidence_*`, `review_action`, `review_note`, `orig_*`, and `review_model`.
+- **Evidence quality and traceability** improved in A/B runs:
+  - `NOT FOUND`: **32 -> 29**
+  - found rows with valid citations: **93 -> 96**
+  - value changes are usually citation-linked (21 value changes, 18 with citation updates)
+
+For full technical details and breakdowns, see [Section 6.1](#61-v10-update-evidence-grounded-llm-review-in-stage-06).
+
 ---
 
 ## 1. What you get
@@ -251,6 +267,53 @@ If you enable LLM fallback:
 - prefer short, evidence-bounded prompts (context is packed from retrieved chunks).
 
 ---
+
+
+### 6.1 v1.0 update: Evidence-grounded LLM review in Stage 06
+
+This upgrade is not just "one more LLM call." It turns Stage 06 from a single-pass extractor into a two-layer, auditable decision pipeline.
+
+#### Two LLM calls, two different responsibilities
+
+1. **Candidate-selection judge (targeted, ROA/ROE only when still missing)**
+   - Trigger: only when ROA/ROE remains `NOT FOUND` after deterministic steps.
+   - Flow: mine candidates from raw retrieval hits (`mine_ratio_candidates_from_hits`) and let `judge_select_candidate` choose an index.
+   - Constraint: the judge must select from provided candidates or return `-1` (no value invention).
+
+2. **Unified post-extraction reviewer (all 5 metrics together)**
+   - Flow: `review_all_metrics_after_extract` issues `keep` / `replace` / `reject` decisions.
+   - Constraint: `replace` must use an allowed evidence citation for that metric; invalid citations are discarded.
+   - Default policy: review only low-confidence rows (`REVIEW_ONLY_LOW_CONFIDENCE=1`) to control cost and minimize unnecessary churn.
+
+#### Why this improves reliability (not just coverage)
+
+- **Evidence credibility**: replacements are evidence-bounded and citation-validated, which reduces free-form hallucination risk.
+- **Traceability**: every review override keeps both new and original fields (`orig_val`, `orig_unit`, `orig_source_chunk_id`).
+- **Debuggability**: confidence and review metadata (`confidence_*`, `review_action`, `review_note`, `review_model`) expose why each decision happened.
+- **Controlled risk posture**: low-confidence rows get active review; medium/high-confidence rows are left stable by default.
+
+#### A/B comparison on the same dataset
+
+- Baseline: `data/outputs/metrics_2024.csv`
+- v1.0: `data/outputs/metrics_2024_llm_full_version1.0.csv`
+- Scope: 25 banks x 5 metrics = 125 rows (same keys in both files)
+
+Key results:
+
+- **Coverage**: `NOT FOUND` reduced from **32 -> 29** (net +3).
+- **Foundness transitions**: 6 rows improved (`NOT FOUND -> FOUND`), 3 rows regressed (`FOUND -> NOT FOUND`).
+- **Confidence-gated review**: 33 rows flagged low confidence (`needs_review=1`), 92 rows skipped by confidence gate.
+- **Review actions**: `reject=27`, `replace=1`, `keep=5`, `skip_by_confidence=92`.
+- **Evidence traceability improved**:
+  - found rows with valid citations: **93 -> 96**
+  - among rows that are found in both versions (90 rows), citation changed in 23 rows
+  - among 21 value-changed rows, 18 also changed citation (value updates stayed evidence-linked)
+- **Audit completeness**: for all 28 `replace/reject` rows, `orig_val` and `orig_source_chunk_id` are present (100%).
+- **Bucket shift**:
+  - old: `ok=86`, `value_missing=32`, `table_prefill=7`
+  - new: `ok=89`, `llm_review_rejected=27`, `value_missing=2`, `table_prefill=6`, `llm_review_replaced=1`
+
+Interpretation: the main gain is a shift from opaque extraction output to an evidence-grounded, reviewable, and rollback-friendly pipeline.
 
 ## 7. Evaluation & debugging
 
