@@ -1,8 +1,18 @@
 # Bank Annual Report / 10-K RAG Metric Extraction (Batch CSV)
 
-Evidence-first RAG pipeline to extract key financial metrics from U.S. community banks’ Annual Reports / 10-K PDFs into a **reproducible CSV**.
+English | [简体中文](README.zh-CN.md)
+
+Evidence-first RAG pipeline to extract key financial metrics from U.S. community banks' Annual Reports / 10-K PDFs into a **reproducible CSV**.
 
 This is **not** a chat demo. The primary deliverable is a **batch metrics table** with **evidence traceability** (`source_chunk_id`) and **failure buckets** to support debugging and evaluation.
+
+### Core algorithm contributions (recall + ranking)
+
+- **Entry-page recall**: BFS crawling with domain constraints plus weighted page scoring to find Annual Report / 10-K hubs from noisy bank websites.
+- **PDF candidate ranking**: year-aware and intent-aware PDF scoring (annual report / 10-K boosts, false-positive penalties) to prioritize target fiscal-year filings.
+- **Metric retrieval recall**: per-metric multi-query FAISS retrieval + bank-constrained filtering + neighbor chunk expansion to recover split table evidence.
+- **Lightweight reranking**: metric-specific keyword bonus/penalty reranker to reduce cross-metric hijacking (for example NIM chunks outranking ROA/ROE evidence).
+- **Measured impact (A/B, 25 banks x 5 metrics)**: `NOT FOUND` **32 -> 29**, found rows with valid citations **93 -> 96**.
 
 ## Update (2026-02-05): v1.0 Evidence-Grounded LLM Review
 
@@ -52,12 +62,16 @@ Each metric record is stored with:
 
 ---
 
-## 2. System overview (Why this is a RAG/LLM project)
+## 2. System overview (Why this is an algorithmic retrieval/ranking project)
 
-### 2.1 Architecture (Evidence → Retrieval → Context → Extraction)
+### 2.1 Architecture (Evidence -> Retrieval -> Context -> Extraction)
 
 1. **Chunk & embed** report text (default embedding model: `BAAI/bge-m3`)
 2. **FAISS retrieval** to gather evidence chunks for each metric
+   - per-metric multi-query retrieval (different query templates for NII/NIM/ROA/ROE/PCL)
+   - bank-aware filtering to prevent cross-bank contamination
+   - neighbor chunk expansion to recover values split across chunk boundaries
+   - lightweight keyword reranker for metric relevance
 3. **Context packing** to build metric-specific evidence context blocks
 4. **Hybrid extraction (deterministic-first)**:
    - **Table-first**: parse financial tables and backfill values when available
@@ -66,7 +80,7 @@ Each metric record is stored with:
 
 ### 2.2 Design rationale (Deterministic-first + Gated LLM)
 
-For batch financial metric extraction, a naive “LLM-first everywhere” approach is often:
+For batch financial metric extraction, a naive "LLM-first everywhere" approach is often:
 
 - expensive at scale,
 - hard to reproduce,
@@ -81,17 +95,27 @@ This repo intentionally uses LLM as a **bounded component**:
 
 This is a common production pattern: **deterministic-first for stability + gated LLM for coverage**.
 
+### 2.3 Optimization target and error model
+
+The main optimization target is not "more LLM calls"; it is better retrieval quality:
+
+- improve **recall** for evidence-bearing chunks (reduce `no_candidates` / `value_missing` caused by miss retrieval),
+- improve **ranking precision** so relevant chunks appear earlier in packed context,
+- preserve **auditability** by keeping evidence citation constraints.
+
+In practice, this project treats retrieval and ranking as first-class algorithm components, and treats LLM as a bounded resolver for hard ambiguity cases.
+
 ---
 
-## 3. Pipeline stages (01–06)
+## 3. Pipeline stages (01-06)
 
 - **01** Collect report entry pages
 - **02** Download Annual Report / 10-K PDFs
-- **03** OCR / text extraction → plain text
+- **03** OCR / text extraction -> plain text
 - **03a/03b** Table sidecar extraction (structured table artifacts)
 - **04** Build embeddings
 - **05** Build FAISS index
-- **06** Extract metrics (table-first → regex fallback → LLM judge)
+- **06** Extract metrics (table-first -> regex fallback -> LLM judge)
 
 ---
 
@@ -109,7 +133,7 @@ python -m pip install -U pip setuptools wheel
 pip install -e .
 ```
 
-> Why a venv? It isolates dependencies (FAISS, PyTorch, sentence-transformers, etc.) so the project is reproducible and won’t conflict with your system Python. If you prefer, you can install into your existing environment—but venv is the safe default.
+> Why a venv? It isolates dependencies (FAISS, PyTorch, sentence-transformers, etc.) so the project is reproducible and won't conflict with your system Python. If you prefer, you can install into your existing environment, but venv is the safe default.
 
 ### 4.2 Use the bundled sample index
 
@@ -184,7 +208,7 @@ python scripts/pipeline/06_extract_metrics_patched_v2_final.py --year 2024
 #### 01) Collect entry pages (bank website discovery)
 
 - Script: `scripts/pipeline/01_collect_entry_pages.py`
-- Purpose: crawl bank sites and score candidate entry pages for **Annual Report / 10-K / Financial Report**.
+- Purpose: maximize annual-report hub recall under noisy navigation using BFS + rule-based page scoring + PDF candidate ranking.
 - Outputs (typical):
   - `data/interim/entry_pages/<YEAR>/*.jsonl` (ranked candidates + scores)
   - `data/outputs/logs/` + `data/outputs/debug/` (timeouts, 403/404, redirects, scoring traces)
@@ -231,10 +255,10 @@ python scripts/pipeline/06_extract_metrics_patched_v2_final.py --year 2024
   - `data/interim/index/faiss_<YEAR>_full/meta.jsonl`
   - `data/interim/index/faiss_<YEAR>_full/merge_log.csv`
 
-#### 06) Extract metrics (hybrid: table-first → regex fallback → LLM judge)
+#### 06) Extract metrics (hybrid: table-first -> regex fallback -> LLM judge)
 
 - Script: `scripts/pipeline/06_extract_metrics_patched_v2_final.py`
-- Purpose: retrieve evidence chunks, extract metrics, and write a **batch CSV** with evidence IDs.
+- Purpose: per-metric multi-query retrieval + rerank + neighbor expansion, then extract metrics and write a **batch CSV** with evidence IDs.
 - Outputs (typical):
   - `data/outputs/processed/metrics_<YEAR>.csv`
   - `data/outputs/debug/` (contexts per metric, raw model outputs, repair traces)
@@ -327,7 +351,7 @@ Interpretation: the main gain is a shift from opaque extraction output to an evi
 ### 7.2 Debugging playbook (recommended)
 
 1. **Evidence exists?**  
-   Check if the metric’s value appears in retrieved contexts.
+   Check if the metric's value appears in retrieved contexts.
 2. **Recall sufficient?**  
    If evidence is missing, improve retrieval (multi-query, rerank, thresholds).
 3. **Parsing correct?**  
@@ -337,9 +361,9 @@ Interpretation: the main gain is a shift from opaque extraction output to an evi
 
 ### 7.3 Where to look
 
-- `data/outputs/processed/` — final CSVs
-- `data/outputs/logs/` — runtime logs
-- `data/outputs/debug/` — debug artifacts (retrieval contexts, intermediate dumps)
+- `data/outputs/processed/` - final CSVs
+- `data/outputs/logs/` - runtime logs
+- `data/outputs/debug/` - debug artifacts (retrieval contexts, intermediate dumps)
 
 ---
 
@@ -352,11 +376,12 @@ This repo follows a **lightweight + reproducible demo** policy:
 
 ---
 
-## 9. Roadmap (upgrade ideas)
+## 9. Roadmap (next upgrades)
 
-- Retrieval: per-metric multi-query + lightweight reranker to improve recall for ROA/ROE/NIM
-- Extraction: stronger unit inference (header/neighbor scan; normalization to consistent units)
-- Learning-based: weak supervision → train reranker or structured extractor for hard buckets
+- Retrieval ranking: move from heuristic keyword bonuses to a trainable reranker with hard-negative mining.
+- Adaptive retrieval policy: dynamic `topk` / score thresholds by metric and bank report style.
+- Extraction: stronger unit inference (header/neighbor scan; normalization to consistent units).
+- Learning-based extraction: weak supervision to train a structured extractor for hard buckets.
 - Derived metrics: compute ROA/ROE when reports require calculation (avg assets/equity)
 
 ---
@@ -365,3 +390,4 @@ This repo follows a **lightweight + reproducible demo** policy:
 
 PDFs and reports are owned by their respective publishers.
 This repository contains code and small derived sample artifacts for demonstration and reproducibility.
+
